@@ -1,0 +1,52 @@
+# gemini.google.com → OpenAI-compatible API
+
+Direct-HTTPS bridge (no browser): `gemini-webapi` (curl_cffi) → FastAPI on port **28407**.
+
+## Run
+
+```bash
+uv venv .venv
+uv pip install -p .venv/bin/python fastapi "uvicorn[standard]" httpx \
+  python-multipart gemini-webapi
+cp .env.example .env            # then put your freeimage.host key in .env (never commit)
+cp accounts.txt.example accounts.txt   # then paste your Gemini cookie jars (never commit)
+.venv/bin/python server.py      # or: ./restart.sh (background + /health check)
+```
+
+Base URL for OpenAI clients: `http://127.0.0.1:28407/v1`
+
+`GET /health` → `{"status":"ok","accounts":2,"freeimage":true}`.
+
+## Endpoints (OpenAI-compatible)
+
+- `POST /v1/chat/completions` (+ `/chat/completions`) — `stream:true` supported
+- `POST /v1/responses` (+ `/responses`), `GET /v1/responses/{id}`
+  - `previous_response_id` chaining, `conversation` param, streaming SSE
+- `GET /v1/models` — registry models + `gemini-3.8-flash*` aliases
+- `POST /v1/files`, `GET /v1/files`, `GET /v1/files/{id}`,
+  `DELETE /v1/files/{id}`, `GET /v1/files/{id}/content`
+- `POST /v1/images/generations` — Gemini image → freeimage.host URL
+- `GET /health`, `GET /v1/conversations/{id}`
+
+## Notes
+
+- **Accounts**: every ```` ``` ```` cookie-jar block in `accounts.txt` is an
+  account (unbounded; currently 2). Round-robin + 3-strike cooldown failover,
+  sticky per conversation. No browser anywhere.
+- **Multi-turn**: native Gemini `ChatSession` per conversation; chained
+  requests send only the new turn. History-prefix replay also dedupes via
+  fingerprinting.
+- **Models**: `gemini-3.8-flash` → registry flash (3.8 on acct 1 / 3.6 on
+  acct 2); `…-thinking` / `…-extended-thinking` / `…-et` set
+  `extended_thinking=True`. `gemini-pro`, `gemini-flash-lite` mapped.
+- **Files**: all part types (`image_url`, `input_image`, `input_file`,
+  `file`, data-URLs, attachments, `/v1/files` ids) for images/JSON/txt/py/…;
+  bytes are staged to real temp paths (`/tmp/gem2oai-uploads/`, cleaned up
+  after each turn) because gemini-webapi derives filename AND content-type
+  from the path — `BytesIO.name` is ignored, so in-memory buffers arrived
+  as `input_*.txt`/`text/plain` (Gemini saw raw IHDR/IDAT chunks).
+  Failed URL downloads degrade to `[Attachment skipped]` text, never 500.
+- **Image output**: `GeneratedImage.save()` bytes → freeimage.host
+  (`display_url` direct CDN link) → `![Generated Image N](url)` markdown.
+  Verified live: "generate an image of a cat" → tabby-cat JPEG (500×273).
+- **Secrets**: `FREEIMAGE_API_KEY` from env/`.env` only; never hardcoded.

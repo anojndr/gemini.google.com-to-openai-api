@@ -1,0 +1,30 @@
+# One Netscape cookie-jar block per Gemini account. Add as many as you like;
+# blocks are round-robin load-balanced (see README). DO NOT COMMIT real cookies:
+# keep your live jars in `accounts.txt` (gitignored) and commit only this file.
+#
+# To export a jar: log in to https://gemini.google.com/app in your browser,
+# then export cookies for google.com in Netscape HTTP Cookie File format
+# (any cookie-export extension works). Each account needs `__Secure-1PSID`
+# (plus `__Secure-1PSIDTS` if your account has it).
+
+account 1:
+
+```
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.google.com	TRUE	/	TRUE	0	__Secure-1PSID	PASTE_ACCOUNT_1_SECURE_1PSID_HERE
+.google.com	TRUE	/	TRUE	0	__Secure-1PSIDTS	PASTE_ACCOUNT_1_SECURE_1PSIDTS_HERE
+```
+
+account 2:
+
+```
+# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.google.com	TRUE	/	TRUE	0	__Secure-1PSID	PASTE_ACCOUNT_2_SECURE_1PSID_HERE
+.google.com	TRUE	/	TRUE	0	__Secure-1PSIDTS	PASTE_ACCOUNT_2_SECURE_1PSIDTS_HERE
+```

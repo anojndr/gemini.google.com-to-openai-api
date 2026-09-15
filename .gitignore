@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+.env
+*.pyc
+temp/
+gem2oai-imgs/
+# Secrets: live Gemini cookie jars (see accounts.txt.example)
+accounts.txt
+# Runtime state
+server.log
+server.pid
