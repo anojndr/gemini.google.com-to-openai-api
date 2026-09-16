@@ -131,8 +131,9 @@ hint; on death/timeout `tail -n 30 server.log`, exit 1.
   overrides). Key deps: `fastapi`, `uvicorn[standard]`, `httpx`,
   `python-multipart`, `gemini-webapi` (`curl_cffi`, `orjson`, `loguru`,
   `pydantic` transitive).
-- **Constraints:** no browser tooling anywhere in the path; no test/lint/format
-  configs to honor; keep changes to existing flat modules, no new dirs.
+- **Constraints:** no browser tooling anywhere in the path; no test configs
+  to honor; keep changes to existing flat modules, no new dirs.
+- **Lint/typecheck:** Always use https://docs.astral.sh/ruff/ with everything enabled and https://docs.astral.sh/ty/ with everything enabled, then fix all of the issues. Make sure to actually fix all of the issues instead of suppressing them.
 
 ## Testing & QA
 
