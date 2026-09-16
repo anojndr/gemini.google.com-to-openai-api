@@ -6,8 +6,6 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-ACCOUNTS_FILE = Path(os.environ.get("GEMINI_ACCOUNTS_FILE", BASE_DIR / "accounts.txt"))
-PORT = int(os.environ.get("PORT", "28407"))
 
 
 def _load_dotenv() -> None:
@@ -25,6 +23,9 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+ACCOUNTS_FILE = Path(os.environ.get("GEMINI_ACCOUNTS_FILE", BASE_DIR / "accounts.txt"))
+PORT = int(os.environ.get("PORT", "28407"))
 
 
 def freeimage_api_key() -> str:

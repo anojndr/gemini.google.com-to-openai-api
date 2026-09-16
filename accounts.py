@@ -19,8 +19,15 @@ _BLOCK_RE = re.compile(r"```\n(.*?)```", re.S)
 def _parse_cookie_block(block: str) -> dict[str, str]:
     cookies: dict[str, str] = {}
     for line in block.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly"):
+            line = line[len("#HttpOnly") :].lstrip()
+        elif line.startswith("#"):
+            continue
         parts = line.split()
-        if len(parts) >= 7 and parts[0].startswith("."):
+        if len(parts) >= 7:
             cookies[parts[5]] = parts[6]
     return cookies
 
@@ -38,6 +45,7 @@ class _Entry:
     client: GeminiClient
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     failures: int = 0
+    live: bool = False
 
 
 class AccountPool:
@@ -58,18 +66,39 @@ class AccountPool:
         self._rr = itertools.cycle(range(len(self._entries)))
 
     async def init_all(self) -> None:
-        await asyncio.gather(*(e.client.init(timeout=450) for e in self._entries))
+        """Init every account; keep successes, mark failures cooled down.
+
+        Raises only when zero accounts initialize (nothing to serve).
+        """
+        results = await asyncio.gather(
+            *(e.client.init(timeout=450) for e in self._entries),
+            return_exceptions=True,
+        )
+        ok = 0
+        for entry, result in zip(self._entries, results):
+            if isinstance(result, Exception):
+                entry.failures = 3
+            else:
+                entry.live = True
+                ok += 1
+        if not ok:
+            raise RuntimeError("No Gemini accounts initialized (all cookie jars failed)")
 
     async def close_all(self) -> None:
-        await asyncio.gather(*(e.client.close() for e in self._entries))
+        await asyncio.gather(
+            *(e.client.close() for e in self._entries if e.live),
+            return_exceptions=True,
+        )
 
     def pick(self) -> tuple[int, GeminiClient]:
-        """Round-robin pick, skipping accounts in cooldown (3 consecutive failures)."""
+        """Round-robin pick, skipping cooled-down accounts; all cooled -> reset one."""
         for _ in range(len(self._entries)):
             i = next(self._rr)
             if self._entries[i].failures < 3:
                 return i, self._entries[i].client
+        # Every account cooled down: forgive the next in rotation so recovery is possible.
         i = next(self._rr)
+        self._entries[i].failures = 0
         return i, self._entries[i].client
 
     def lock_for(self, index: int) -> asyncio.Lock:

@@ -9,8 +9,10 @@ Gemini detects images, JSON, txt, py, etc.
 from __future__ import annotations
 
 import base64
+import hashlib
 import mimetypes
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -19,6 +21,13 @@ import httpx
 _DATA_URL_PREFIX = "data:"
 _UPLOAD_DIR = Path(tempfile.gettempdir()) / "gem2oai-uploads"
 _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# Reap files from crashed runs / leaked turns (older than 1 day).
+for _stale in _UPLOAD_DIR.glob("*"):
+    try:
+        if _stale.is_file() and _stale.stat().st_mtime < (time.time() - 86400):
+            _stale.unlink()
+    except OSError:
+        pass
 _EXT_BY_MIME = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -106,7 +115,7 @@ async def _part_to_file(
             stored = UploadStore.get(file_id)
             if stored:
                 return _as_upload(stored[0], stored[1], stored[2])
-            return None
+            raise ValueError(f"unknown file_id: {file_id}")
         if file_data:
             data, mime = _decode_data_url(file_data)
             return _as_upload(data, mime, part.get("filename") or f.get("filename"))
@@ -118,7 +127,14 @@ async def _part_to_file(
         return None
     if ptype in ("input_image", "image_url", "image"):
         img = part.get("image_url", part.get("image", part))
-        url = img.get("url") if isinstance(img, dict) else img if isinstance(part.get("image_url"), str) else None
+        url: str | None = None
+        if isinstance(img, dict):
+            u = img.get("url")
+            url = u if isinstance(u, str) else None
+        elif isinstance(img, str):
+            url = img
+        if not url and isinstance(part.get("image_url"), str):
+            url = part["image_url"]
         if not url:
             url = part.get("url") if isinstance(part.get("url"), str) else None
         if not url:
@@ -127,24 +143,32 @@ async def _part_to_file(
             data, mime = _decode_data_url(url)
             return _as_upload(data, mime, part.get("filename"))
         data, mime = await _download(http, url)
-        return _as_upload(data, mime, part.get("filename") or url.split("?")[0].rsplit("/", 1)[-1])
-    return None
+        tail = url.split("?", 1)[0].rsplit("/", 1)[-1].split("#", 1)[0]
+        return _as_upload(data, mime, part.get("filename") or tail)
 
 
 def _decode_data_url(url: str) -> tuple[bytes, str | None]:
-    header, _, payload = url.partition(",")
+    header, sep, payload = url.partition(",")
+    if not sep or not payload:
+        raise ValueError("invalid data URL (missing ',' payload)")
     mime = header.split(";")[0].split(":")[1] if ":" in header else None
     data = base64.b64decode(payload, validate=False)
     return data, mime
 
 
 class UploadStore:
-    """Files API storage: id -> (bytes, mime, filename)."""
+    """Files API storage: id -> (bytes, mime, filename). Bounded (FIFO cap)."""
 
     _files: dict[str, tuple[bytes, str, str]] = {}
+    _cap: int = 200
+    MAX_BYTES: int = 25 * 1024 * 1024
 
     @classmethod
     def put(cls, data: bytes, mime: str, filename: str) -> str:
+        if len(data) > cls.MAX_BYTES:
+            raise ValueError(f"file too large ({len(data)} bytes > {cls.MAX_BYTES})")
+        while len(cls._files) >= cls._cap:
+            cls._files.pop(next(iter(cls._files)))
         fid = f"file_{uuid.uuid4().hex[:24]}"
         cls._files[fid] = (data, mime, filename)
         return fid
@@ -202,6 +226,11 @@ async def message_to_turn(
     return role, "\n\n".join(texts), uploads
 
 
+def _short(val: str) -> str:
+    """Identity-safe shortening: full value when short, sha256 digest when long."""
+    return val[:160] if len(val) <= 160 else hashlib.sha256(val.encode()).hexdigest()[:16]
+
+
 def part_identity(part: object) -> str:
     """Cheap file identity (no downloads) for conversation fingerprinting."""
     if not isinstance(part, dict):
@@ -209,16 +238,16 @@ def part_identity(part: object) -> str:
     for key in ("filename", "file_id", "file_data", "url"):
         val = part.get(key)
         if isinstance(val, str) and val:
-            return f"{key}={val[:160]}"
+            return f"{key}={_short(val)}"
     for key in ("file", "image_url", "image"):
         nested = part.get(key)
         if isinstance(nested, dict):
-            for sub in ("filename", "file_id", "url"):
+            for sub in ("filename", "file_id", "file_data", "url"):
                 val = nested.get(sub)
                 if isinstance(val, str) and val:
-                    return f"{key}.{sub}={val[:160]}"
+                    return f"{key}.{sub}={_short(val)}"
         elif isinstance(nested, str) and nested:
-            return f"{key}={nested[:160]}"
+            return f"{key}={_short(nested)}"
     return part.get("type", "")
 
 

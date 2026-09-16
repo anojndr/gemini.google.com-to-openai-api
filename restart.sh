@@ -55,4 +55,5 @@ done
 
 echo "!! Timed out waiting for /health. Last log lines:"
 tail -n 30 "$LOG"
+kill "$NEW_PID" 2>/dev/null || true
 exit 1

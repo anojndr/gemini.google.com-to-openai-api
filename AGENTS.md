@@ -114,11 +114,11 @@ hint; on death/timeout `tail -n 30 server.log`, exit 1.
 - `README.md` — sole doc; install/run/endpoints/secrets reference.
 - `restart.sh` — only helper script; entire ops surface.
 - `.env` — `FREEIMAGE_API_KEY`, `PORT` (gitignored, never commit/read aloud).
-- `accounts.txt` — cookie jars, secret-equivalent but NOT gitignored: do not
-  commit or paste contents.
-- `server.log` / `server.pid` — nohup output + live PID (not ignored).
+- `accounts.txt` — cookie jars, secret-equivalent and gitignored (see
+  `accounts.txt.example` for the committed template): do not commit or paste contents.
+- `server.log` / `server.pid` — nohup output + live PID (gitignored runtime state).
 - `.gitignore` — `__pycache__/`, `.venv/`, `.env`, `*.pyc`, `temp/`,
-  `gem2oai-imgs/`.
+  `gem2oai-imgs/`, `accounts.txt`, `server.log`, `server.pid`.
 
 ## Runtime/Tooling Preferences
 

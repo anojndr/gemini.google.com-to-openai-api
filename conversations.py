@@ -12,11 +12,12 @@ import asyncio
 
 
 class SessionState:
-    __slots__ = ("account", "lock", "metadata")
+    __slots__ = ("account", "lock", "metadata", "norm")
 
     def __init__(self) -> None:
         self.account: int | None = None
         self.metadata: list = []
+        self.norm: list[str] = []
         self.lock = asyncio.Lock()
 
 
@@ -51,11 +52,36 @@ class SessionStore:
                 return state, True
             return state, False
 
+    async def lock_for(self, key: str) -> asyncio.Lock:
+        """Per-conversation lock serializing read-modify-write of one session."""
+        state, _ = await self.get_or_new(key)
+        return state.lock
+
     async def link(self, alias: str, key: str) -> None:
         async with self._guard:
             self._aliases[alias] = self._resolve(key)
             if len(self._aliases) > self._cap * 2:
                 self._aliases.pop(next(iter(self._aliases)))
+
+    async def set_norm(self, key: str, norm: list[str]) -> None:
+        async with self._guard:
+            state = self._states.get(self._resolve(key))
+            if state is not None:
+                state.norm = list(norm)
+    async def get_norm(self, key: str) -> list[str] | None:
+        async with self._guard:
+            state = self._states.get(self._resolve(key))
+            return list(state.norm) if state else None
+
+    async def touch(self, key: str) -> SessionState | None:
+        """Move state to MRU end so eviction drops idle sessions first."""
+        async with self._guard:
+            key = self._resolve(key)
+            state = self._states.pop(key, None)
+            if state is None:
+                return None
+            self._states[key] = state
+            return state
 
     async def save_response(self, rid: str, obj: dict) -> None:
         async with self._guard:
