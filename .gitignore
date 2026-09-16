@@ -9,3 +9,4 @@ accounts.txt
 # Runtime state
 server.log
 server.pid
+gem2oai.db*

@@ -13,6 +13,11 @@ Base URL: `http://127.0.0.1:28407/v1`. Health: `GET /health` →
 - **Shim, not a framework:** `server.py` (FastAPI routes) → `content.py`
   (parts → prompt + staged files) → `accounts.py` (`GeminiClient` pool) →
   native Gemini `ChatSession` → `freeimage.py` (generated-image re-host).
+- **Persistence (SQLite, `gem2oai.db`):** `store.py:connect` (WAL,
+  `busy_timeout`, shared schema) → `conversations.py:SessionStore`
+  (sessions/aliases write-through, responses write-through + lazy rehydrate)
+  and `content.py:UploadStore` (file bytes write-through, `bind` in
+  lifespan). Nothing is lost on restart: chains and `/v1/files` ids survive.
 - **Continuation without replay:** each conversation resumes server-side
   Gemini history via metadata `[cid, rid, rcid]` in `conversations.py`
   `SessionStore` (`key/alias → {account, metadata}`, response objects by id,
@@ -39,8 +44,8 @@ Base URL: `http://127.0.0.1:28407/v1`. Health: `GET /health` →
 ## Key Directories
 
 Flat root — no `src/`, `tests/`, or `docs/`:
-- `.` — all 6 modules + `README.md`, `restart.sh`, `accounts.txt`, `.env`,
-  `server.log`, `server.pid`.
+- `.` — all 7 modules + `README.md`, `restart.sh`, `accounts.txt`, `.env`,
+  `gem2oai.db`, `server.log`, `server.pid`.
 - `.venv/` — uv-managed CPython 3.12, isolated (gitignored).
 - `__pycache__/` — gitignored.
 - `/tmp/gem2oai-uploads/` — staged upload temp files (auto-cleaned per turn).
@@ -102,13 +107,18 @@ hint; on death/timeout `tail -n 30 server.log`, exit 1.
   `uvicorn.run(app, host="0.0.0.0", port=PORT)` in `__main__`.
 - `content.py` — `message_to_turn`, `openai_messages_to_prompt`,
   `responses_input_to_prompt`, `_part_to_file`, `_as_upload`, `UploadFile`
-  (staged path + `cleanup()`), `UploadStore` (Files API memory), `part_identity`.
+  (staged path + `cleanup()`), `UploadStore` (Files API, SQLite-backed),
+  `part_identity`.
 - `accounts.py` — `load_account_cookies`, `AccountPool` (pick/lock_for/report,
   `init_all`/`close_all`, `models`, `resolve`, `display_slugs`).
-- `conversations.py` — `SessionStore` (`get`/`get_or_new`/`link`,
-  `save_response`/`get_response`), `SessionState{account, metadata, lock}`.
+- `conversations.py` — `SessionStore` (SQLite-backed: `get`/`get_or_new`/
+  `persist`/`link`, `save_response`/`get_response`),
+  `SessionState{account, metadata, lock}`.
+- `store.py` — `connect(path)` (SQLite WAL schema: sessions/aliases/
+  responses/files); shared by both stores.
 - `config.py` — `BASE_DIR`, `ACCOUNTS_FILE` (`GEMINI_ACCOUNTS_FILE`),
-  `PORT` (default `28407`), `_load_dotenv`, `freeimage_api_key`.
+  `PORT` (default `28407`), `DB_PATH` (`GEMINI_DB_PATH`, default
+  `gem2oai.db`), `_load_dotenv`, `freeimage_api_key`.
 - `freeimage.py` — `upload_png(http, data, filename)`, `ENDPOINT =
   https://freeimage.host/api/1/upload`.
 - `README.md` — sole doc; install/run/endpoints/secrets reference.
@@ -118,7 +128,7 @@ hint; on death/timeout `tail -n 30 server.log`, exit 1.
   `accounts.txt.example` for the committed template): do not commit or paste contents.
 - `server.log` / `server.pid` — nohup output + live PID (gitignored runtime state).
 - `.gitignore` — `__pycache__/`, `.venv/`, `.env`, `*.pyc`, `temp/`,
-  `gem2oai-imgs/`, `accounts.txt`, `server.log`, `server.pid`.
+  `gem2oai-imgs/`, `gem2oai.db*`, `accounts.txt`, `server.log`, `server.pid`.
 
 ## Runtime/Tooling Preferences
 

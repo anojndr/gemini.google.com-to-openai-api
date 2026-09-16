@@ -1,3 +1,4 @@
+# Copyright 2026 gem2oai contributors.
 """freeimage.host upload for Gemini-generated images. Key from env only."""
 
 from __future__ import annotations
@@ -26,11 +27,13 @@ async def upload_png(http: httpx.AsyncClient, data: bytes, filename: str) -> str
         )
         r.raise_for_status()
         body = r.json()
-        if isinstance(body, dict):
-            img = body.get("image") or {}
-            if isinstance(img, dict):
-                return img.get("display_url") or img.get("url") or body.get("url")
-            return body.get("url")
+    except (httpx.HTTPError, OSError, ValueError):
         return None
-    except Exception:
+    if not isinstance(body, dict):
         return None
+    img = body.get("image") or {}
+    if isinstance(img, dict):
+        display = img.get("display_url") or img.get("url") or body.get("url")
+        return display if isinstance(display, str) else None
+    url = body.get("url")
+    return url if isinstance(url, str) else None

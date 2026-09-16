@@ -36,6 +36,10 @@ Base URL for OpenAI clients: `http://127.0.0.1:28407/v1`
 - **Multi-turn**: native Gemini `ChatSession` per conversation; chained
   requests send only the new turn. History-prefix replay also dedupes via
   fingerprinting.
+- **Persistence**: conversations, aliases, response objects, and uploaded
+  files live in SQLite (`gem2oai.db`, WAL mode; `GEMINI_DB_PATH` overrides)
+  and survive restarts — chains (`conversation_id`, `previous_response_id`,
+  fingerprint prefixes) and `/v1/files` ids keep working after `./restart.sh`.
 - **Models**: `gemini-3.8-flash` → registry flash (3.8 on acct 1 / 3.6 on
   acct 2); `…-thinking` / `…-extended-thinking` / `…-et` set
   `extended_thinking=True`. `gemini-pro`, `gemini-flash-lite` mapped.

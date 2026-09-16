@@ -1,3 +1,4 @@
+# Copyright 2026 gem2oai contributors.
 """gemini.google.com -> OpenAI-compatible API (Chat Completions + Responses).
 
 Backend: gemini-webapi over direct HTTPS (curl_cffi, no browser).
@@ -11,38 +12,52 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import mimetypes
 import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from gemini_webapi.exceptions import (
+    APIError,
+    AuthError,
+    GeminiError,
+)
+from gemini_webapi.types import GeneratedImage, Image, ModelOutput
+from starlette.datastructures import UploadFile as StarletteUploadFile
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from gemini_webapi import ChatSession
 
 import freeimage
-from accounts import AccountPool, load_account_cookies
-from config import ACCOUNTS_FILE, PORT, freeimage_api_key
-from content import (
-    UploadStore,
-    message_to_turn,
-    openai_messages_to_prompt,
-    part_identity,
-    responses_input_to_prompt,
-)
+from accounts import AccountPool, GeminiClient, load_account_cookies
+from config import ACCOUNTS_FILE, DB_PATH, PORT, freeimage_api_key
+from content import UploadFile, UploadStore, message_to_turn, part_identity
 from conversations import SessionStore
 
-IMG_TMP = Path(tempfile.gettempdir()) / "gem2oai-imgs"
-IMG_TMP.mkdir(parents=True, exist_ok=True)
+_log = logging.getLogger("gem2oai")
+
+Json = dict[str, Any]
+JsonList = list[dict[str, Any]]
+HandlerResult = Json | JSONResponse | StreamingResponse
 
 THINKING_ALIASES = {
     "gemini-3.8-flash-thinking",
     "gemini-3.8-flash-extended-thinking",
     "gemini-3.8-flash-et",
 }
+
+IMG_TMP = Path(tempfile.gettempdir()) / "gem2oai-imgs"
+IMG_TMP.mkdir(parents=True, exist_ok=True)
 
 
 def _now() -> int:
@@ -74,41 +89,170 @@ def _resolve_model(pool: AccountPool, name: str | None) -> tuple[str | None, boo
     return pool.resolve(name), thinking
 
 
-def _model_list(pool: AccountPool) -> list[dict]:
-    seen: dict[str, dict] = {m["id"]: m for m in pool.models()}
+def _model_list(pool: AccountPool) -> list[Json]:
+    """List registry models plus display-slug and flash aliases, sorted by id."""
+    seen: dict[str, Json] = {str(m["id"]): m for m in pool.models()}
     for slug in pool.display_slugs():
         seen.setdefault(
-            slug, {"id": slug, "object": "model", "created": 0, "owned_by": "gemini"}
+            slug,
+            {"id": slug, "object": "model", "created": 0, "owned_by": "gemini"},
         )
     for alias in ["gemini-3.8-flash", *sorted(THINKING_ALIASES)]:
         seen.setdefault(
-            alias, {"id": alias, "object": "model", "created": 0, "owned_by": "gemini"}
+            alias,
+            {"id": alias, "object": "model", "created": 0, "owned_by": "gemini"},
         )
     return [seen[k] for k in sorted(seen)]
 
 
-# --------------------------------------------------------------- app boot ---
+def _chat_completion(
+    model_name: str | None,
+    key: str,
+    text: str,
+    thoughts: str,
+    prompt_for_usage: str,
+) -> dict[str, Any]:
+    """Build a buffered chat-completion response object."""
+    msg: Json = {"role": "assistant", "content": text}
+    if thoughts:
+        msg["reasoning_content"] = thoughts
+    return {
+        "id": _new_id("chatcmpl-"),
+        "object": "chat.completion",
+        "created": _now(),
+        "model": model_name or "gemini-flash",
+        "choices": [
+            {
+                "index": 0,
+                "message": msg,
+                "finish_reason": "stop",
+            },
+        ],
+        "usage": _usage(prompt_for_usage, text),
+        "conversation_id": key.removeprefix("conv:")
+        if key.startswith("conv:")
+        else None,
+    }
+
+
+def _chat_chunk(
+    cid: str,
+    model_name: str | None,
+    delta: Json,
+    usage: Json | None = None,
+) -> str:
+    """Encode one chat-completion chunk as an SSE frame."""
+    choice: Json = {"index": 0, "delta": delta, "finish_reason": None}
+    if usage is not None:
+        choice["finish_reason"] = "stop"
+    body: Json = {
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": _now(),
+        "model": model_name or "gemini-flash",
+        "choices": [choice],
+    }
+    if usage is not None:
+        body["usage"] = usage
+    return _sse(body)
+
+
+async def _chat_delta_frames(
+    cid: str,
+    model_name: str | None,
+    payload: str,
+    state: Json,
+) -> AsyncIterator[str]:
+    """Yield role (once) plus content frames for one text delta."""
+    if not state["sent_role"]:
+        state["sent_role"] = True
+        yield _chat_chunk(cid, model_name, {"role": "assistant"})
+    state["full"] += payload
+    yield _chat_chunk(cid, model_name, {"content": payload})
+
+
+class ChatDoneContext(NamedTuple):
+    """Context for persisting chat state and yielding done frames."""
+
+    cid: str
+    key: str
+    account: int
+    new_meta: list[str | None]
+    messages: JsonList
+    model_name: str | None
+    prompt_for_usage: str
+    out: ModelOutput
+
+
+async def _chat_done_frames(
+    http: httpx.AsyncClient,
+    sessions: SessionStore,
+    ctx: ChatDoneContext,
+    state: Json,
+) -> AsyncIterator[str]:
+    """Persist completion state and yield image/stop frames for one done event."""
+    md = await _gemini_images_to_markdown(http, ctx.out)
+    if md:
+        state["full"] += md
+        yield _chat_chunk(
+            cid=ctx.cid,
+            model_name=ctx.model_name,
+            delta={"content": md},
+        )
+    await _save_state(
+        sessions,
+        ctx.key,
+        ctx.account,
+        ctx.new_meta,
+        _fingerprint(ctx.messages),
+    )
+    yield _chat_chunk(
+        cid=ctx.cid,
+        model_name=ctx.model_name,
+        delta={},
+        usage=_usage(ctx.prompt_for_usage, state["full"]),
+    )
+
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Boot accounts, SQLite stores, and shared HTTP client; close on shutdown."""
     cookies = load_account_cookies(str(ACCOUNTS_FILE))
     pool = AccountPool(cookies)
     try:
         await pool.init_all()
     except RuntimeError as exc:
-        print(f"gem2oai: FATAL: {exc}")
-        raise RuntimeError(str(exc)) from exc
+        _log.exception("gem2oai: FATAL: %s", exc)
+        msg = str(exc)
+        raise RuntimeError(msg) from exc
+    sessions = SessionStore(path=DB_PATH)
+    try:
+        UploadStore.bind(DB_PATH)
+    except OSError:
+        sessions.close()
+        await pool.close_all()
+        raise
     app.state.pool = pool
-    app.state.sessions = SessionStore()
+    app.state.sessions = sessions
     app.state.http = httpx.AsyncClient(timeout=120, follow_redirects=True)
-    print(f"gem2oai: {len(cookies)} account(s) ready, freeimage={'yes' if freeimage_api_key() else 'NO KEY'}")
+    _log.info(
+        "gem2oai: %d account(s) ready, freeimage=%s",
+        len(cookies),
+        "yes" if freeimage_api_key() else "NO KEY",
+    )
     yield
     await app.state.http.aclose()
     await pool.close_all()
+    app.state.sessions.close()
+    UploadStore.close()
+
 
 app = FastAPI(title="gemini.google.com-to-openai-api", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -123,6 +267,7 @@ def _sessions(req: Request) -> SessionStore:
 def _http(req: Request) -> httpx.AsyncClient:
     return req.app.state.http
 
+
 def _err(status: int, message: str, code: str = "server_error") -> JSONResponse:
     return JSONResponse(
         status_code=status,
@@ -130,19 +275,43 @@ def _err(status: int, message: str, code: str = "server_error") -> JSONResponse:
     )
 
 
-def _is_upstream_error(exc: Exception) -> bool:
-    """True when the failure implicates the Gemini account/network, not our input."""
+def _is_upstream_error(exc: BaseException) -> bool:
+    """Check whether the failure implicates the Gemini account or network."""
     name = type(exc).__name__
     msg = str(exc).lower()
-    if any(k in name for k in ("Timeout", "Auth", "UsageLimit", "Blocked", "APIError", "GeminiError")):
+    if any(
+        k in name
+        for k in (
+            "Timeout",
+            "Auth",
+            "UsageLimit",
+            "Blocked",
+            "APIError",
+            "GeminiError",
+        )
+    ):
         return True
     return any(
         k in msg
-        for k in ("timed out", "timeout", "429", "503", "500", "unauth", "auth", "quota", "blocked", "network", "connection", "reset")
+        for k in (
+            "timed out",
+            "timeout",
+            "429",
+            "503",
+            "500",
+            "unauth",
+            "auth",
+            "quota",
+            "blocked",
+            "network",
+            "connection",
+            "reset",
+        )
     )
 
 
-def _map_exception(exc: Exception) -> tuple[int, str]:
+def _map_exception(exc: BaseException) -> tuple[int, str]:
+    """Map an upstream failure to an (HTTP status, message) pair."""
     name = type(exc).__name__
     msg = str(exc) or name
     if "UsageLimitExceeded" in name or "429" in msg:
@@ -153,91 +322,125 @@ def _map_exception(exc: Exception) -> tuple[int, str]:
         return 502, msg
     return 500, msg
 
+
 # ------------------------------------------------------------ gemini run ---
+
+TurnUpload = tuple[UploadFile, str]
+Turn = tuple[str, list[TurnUpload]]
+StreamDelta = tuple[str, str]
+StreamDone = tuple[str, tuple[ModelOutput | None, list[str | None]]]
+
+
+async def _send_turn(
+    chat: ChatSession,
+    text: str,
+    uploads: list[TurnUpload],
+    *,
+    thinking: bool,
+) -> ModelOutput:
+    """Send one text turn plus staged file paths; always clean up staging."""
+    files: list[str] | None = [str(up.path) for up, _ in uploads] or None
+    try:
+        return await chat.send_message(
+            text.strip() or " ",
+            files=files,  # ty: ignore[invalid-argument-type]
+            extended_thinking=thinking,
+        )
+    finally:
+        for up, _ in uploads:
+            up.cleanup()
+
+
+class RunRequest(NamedTuple):
+    """Everything needed to replay turns through one Gemini ChatSession."""
+
+    account: int
+    model: str | None
+    thinking: bool
+    turns: list[Turn]
+    metadata: list[str | None]
 
 
 async def _run_turns(
     pool: AccountPool,
-    account: int,
-    model: str | None,
-    thinking: bool,
-    turns: list[tuple[str, list]],
-    metadata: list,
-) -> tuple[Any, list]:
+    request: RunRequest,
+) -> tuple[ModelOutput, list[str | None]]:
     """Replay turns through one native ChatSession. Returns (final output, metadata)."""
-    client = _client_at(pool, account) if account >= 0 else pool.pick()[1]
-    chat = client.start_chat(
-        model=model, **({"metadata": metadata} if metadata else {})
+    client = (
+        _client_at(pool, request.account) if request.account >= 0 else pool.pick()[1]
     )
-    out = None
+    chat = client.start_chat(
+        model=request.model,
+        **({"metadata": request.metadata} if request.metadata else {}),
+    )
+    out: ModelOutput | None = None
     try:
-        async with pool.lock_for(account):
-            for text, uploads in turns:
-                files = [str(up.path) for up, _ in uploads] or None
-                try:
-                    out = await chat.send_message(
-                        text.strip() or " ",
-                        files=files,
-                        extended_thinking=thinking,
-                    )
-                finally:
-                    for up, _ in uploads:
-                        up.cleanup()
-        pool.report(account, True)
-        return out, list(chat.metadata)
-    except Exception as exc:
-        pool.report(account, not _is_upstream_error(exc))
+        async with pool.lock_for(request.account):
+            for text, uploads in request.turns:
+                out = await _send_turn(chat, text, uploads, thinking=request.thinking)
+        pool.report(request.account, ok=True)
+        return _require_output(out, chat)
+    except ValueError:
+        pool.report(request.account, ok=True)
+        raise
+    except (
+        GeminiError,
+        AuthError,
+        APIError,
+        httpx.HTTPError,
+        OSError,
+    ) as exc:
+        pool.report(request.account, ok=not _is_upstream_error(exc))
         raise
 
 
-def _client_at(pool: AccountPool, account: int):
-    return pool._entries[account].client
+def _require_output(
+    out: ModelOutput | None,
+    chat: ChatSession,
+) -> tuple[ModelOutput, list[str | None]]:
+    """Return the turn output and metadata, rejecting empty turn lists."""
+    if out is None:
+        msg = "no turns to send"
+        raise ValueError(msg)
+    return out, list(chat.metadata)
 
 
+def _client_at(pool: AccountPool, account: int) -> GeminiClient:
+    """Return the Gemini client at a pool index."""
+    return pool.client_at(account)
 
 
 async def _run_turns_stream(
     pool: AccountPool,
-    account: int,
-    model: str | None,
-    thinking: bool,
-    turns: list[tuple[str, list]],
-    metadata: list,
-):
+    request: RunRequest,
+) -> AsyncIterator[StreamDelta | StreamDone]:
     """Replay prior turns, then stream the final turn's deltas.
 
     Yields ("delta", text) chunks, then ("done", (output, metadata)).
     Holds the account lock for the whole conversation update.
     Raises ValueError when turns is empty (caller must 400, not stream).
     """
-    if not turns:
-        raise ValueError("no turns to send")
-    client = _client_at(pool, account)
+    if not request.turns:
+        msg = "no turns to send"
+        raise ValueError(msg)
+    client = _client_at(pool, request.account)
     chat = client.start_chat(
-        model=model, **({"metadata": metadata} if metadata else {})
+        model=request.model,
+        **({"metadata": request.metadata} if request.metadata else {}),
     )
-    lock = pool.lock_for(account)
+    lock = pool.lock_for(request.account)
     await lock.acquire()
     try:
-        out = None
-        for text, uploads in turns[:-1]:
-            files = [str(up.path) for up, _ in uploads] or None
-            try:
-                out = await chat.send_message(
-                    text.strip() or " ",
-                    files=files,
-                    extended_thinking=thinking,
-                )
-            finally:
-                for up, _ in uploads:
-                    up.cleanup()
-        text, uploads = turns[-1]
-        files = [str(up.path) for up, _ in uploads] or None
+        out: ModelOutput | None = None
+        for text, uploads in request.turns[:-1]:
+            out = await _send_turn(chat, text, uploads, thinking=request.thinking)
+        text, uploads = request.turns[-1]
+        files: list[str] | None = [str(up.path) for up, _ in uploads] or None
         try:
             async for chunk in chat.send_message_stream(
                 text.strip() or " ",
-                files=files,
-                extended_thinking=thinking,
+                files=files,  # ty: ignore[invalid-argument-type]
+                extended_thinking=request.thinking,
             ):
                 out = chunk
                 if chunk.text_delta:
@@ -245,10 +448,19 @@ async def _run_turns_stream(
         finally:
             for up, _ in uploads:
                 up.cleanup()
-        pool.report(account, True)
+        pool.report(request.account, ok=True)
         yield ("done", (out, list(chat.metadata)))
-    except Exception as exc:
-        pool.report(account, not _is_upstream_error(exc))
+    except ValueError:
+        pool.report(request.account, ok=True)
+        raise
+    except (
+        GeminiError,
+        AuthError,
+        APIError,
+        httpx.HTTPError,
+        OSError,
+    ) as exc:
+        pool.report(request.account, ok=not _is_upstream_error(exc))
         raise
     finally:
         lock.release()
@@ -257,44 +469,60 @@ async def _run_turns_stream(
 # ---------------------------------------------------------------- images ---
 
 
+async def _rehost_image(
+    http: httpx.AsyncClient,
+    img: Image,
+    idx: int,
+) -> str | None:
+    """Save one Gemini image and re-host it; fall back to the Gemini URL."""
+    url = img.url or ""
+    try:
+        path = await img.save(
+            path=str(IMG_TMP),
+            filename=f"gen_{uuid.uuid4().hex[:8]}",
+        )
+    except (OSError, ValueError, RuntimeError, httpx.HTTPError):
+        return f"![image]({url})" if url else None
+    try:
+        data = await asyncio.to_thread(Path(path).read_bytes)
+    except (OSError, ValueError, RuntimeError):
+        return f"![image]({url})" if url else None
+    finally:
+        await asyncio.to_thread(Path(path).unlink, missing_ok=True)
+    public = await freeimage.upload_png(http, data, f"gemini_{idx}.png")
+    return f"![Generated Image {idx}]({public or url})"
+
+
 async def _gemini_images_to_markdown(
-    http: httpx.AsyncClient, out: Any
+    http: httpx.AsyncClient,
+    out: ModelOutput,
 ) -> str:
     """Download generated/web images, re-host on freeimage, return markdown block."""
-    imgs = list(getattr(out, "images", None) or [])
+    imgs = list(out.images or [])
     if not imgs:
         return ""
-    md: list[str] = []
-
-    async def one(idx: int, img: Any) -> str | None:
-        url = getattr(img, "url", "")
-        try:
-            path = await img.save(path=str(IMG_TMP), filename=f"gen_{uuid.uuid4().hex[:8]}")
-            data = Path(path).read_bytes()
-            try:
-                Path(path).unlink()
-            except OSError:
-                pass
-        except Exception:
-            return f"![image]({url})" if url else None
-        public = await freeimage.upload_png(http, data, f"gemini_{idx}.png")
-        return f"![Generated Image {idx}]({public or url})"
-
-    for idx, line in enumerate(await asyncio.gather(*(one(i, im) for i, im in enumerate(imgs)))):
-        if line:
-            md.append(line)
+    md = [
+        line
+        for line in await asyncio.gather(
+            *(_rehost_image(http, img, i) for i, img in enumerate(imgs)),
+        )
+        if line
+    ]
     return ("\n\n" + "\n\n".join(md)) if md else ""
 
 
-def _full_text(out: Any) -> str:
-    return getattr(out, "text", "") or ""
+def _full_text(out: ModelOutput) -> str:
+    """Return the completed text of a Gemini output."""
+    return out.text or ""
 
 
-def _thoughts(out: Any) -> str:
-    return getattr(out, "thoughts", None) or ""
+def _thoughts(out: ModelOutput) -> str:
+    """Return the extended-thinking trace of a Gemini output, if any."""
+    return out.thoughts or ""
 
 
-def _usage(prompt: str, completion: str) -> dict:
+def _usage(prompt: str, completion: str) -> dict[str, int]:
+    """Estimate OpenAI-style token usage from character counts."""
     pt, ct = max(1, len(prompt) // 4), max(1, len(completion) // 4)
     return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 
@@ -302,7 +530,8 @@ def _usage(prompt: str, completion: str) -> dict:
 # ------------------------------------------------- conversation chaining ---
 
 
-def _fingerprint(messages: list[dict]) -> str:
+def _fingerprint(messages: JsonList) -> str:
+    """Hash chat messages (text inline, files by identity) for replay dedup."""
     parts: list[str] = []
     for m in messages:
         c = m.get("content", "")
@@ -310,19 +539,44 @@ def _fingerprint(messages: list[dict]) -> str:
             parts.append(f"{m.get('role', '')}:{c}")
         else:
             inner = "|".join(
-                (p.get("text", "") if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text") else part_identity(p))
+                (
+                    p.get("text", "")
+                    if isinstance(p, dict)
+                    and p.get("type") in ("text", "input_text", "output_text")
+                    else part_identity(p)
+                )
                 for p in (c or [])
             )
             parts.append(f"{m.get('role', '')}:{inner}")
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:24]
 
 
+def _prefix_turn(role: str, text: str, uploads: list[TurnUpload]) -> Turn:
+    """Tag a system turn; other roles pass through unchanged."""
+    prefix = "[System] " if role == "system" else ""
+    return (f"{prefix}{text}", uploads)
+
+
+async def _fresh_turns(
+    http: httpx.AsyncClient,
+    messages: JsonList,
+) -> list[Turn]:
+    """Convert unseen-history messages to user/system turns for a new session."""
+    turns: list[Turn] = []
+    for m in messages:
+        role, text, uploads = await message_to_turn(http, m)
+        if role in ("assistant", "tool"):
+            continue
+        turns.append(_prefix_turn(role, text, uploads))
+    return turns or [(" ", [])]
+
+
 async def _chat_turns(
     http: httpx.AsyncClient,
     sessions: SessionStore,
-    messages: list[dict],
+    messages: JsonList,
     conversation_id: str | None,
-) -> tuple[str, list[tuple[str, list]], list]:
+) -> tuple[str, list[Turn], list[str | None]]:
     """Resolve (state_key, new turns, resume metadata) for a Chat request.
 
     Chained requests send ONLY the new trailing message(s); unseen histories
@@ -339,18 +593,11 @@ async def _chat_turns(
                 if role in ("assistant", "tool"):
                     for up, _ in uploads:
                         up.cleanup()
-                    raise ValueError("last message has role assistant/tool; nothing new to send")
-                prefix = "[System] " if role == "system" else ""
-                turns.append((f"{prefix}{text}", uploads))
+                    msg = "last message has role assistant/tool; nothing new to send"
+                    raise ValueError(msg)
+                turns.append(_prefix_turn(role, text, uploads))
             return key, turns, state.metadata
-        turns = []
-        for m in messages:
-            role, text, uploads = await message_to_turn(http, m)
-            if role in ("assistant", "tool"):
-                continue
-            prefix = "[System] " if role == "system" else ""
-            turns.append((f"{prefix}{text}", uploads))
-        return key, turns or [(" ", [])], []
+        return key, await _fresh_turns(http, messages), []
 
     if len(messages) > 1:
         prev_fp = _fingerprint(messages[:-1])
@@ -360,25 +607,20 @@ async def _chat_turns(
             state, _ = await sessions.get_or_new(key)
             state.account = prev.account
             state.metadata = prev.metadata
+            await sessions.persist(key)
             role, text, uploads = await message_to_turn(http, messages[-1])
-            prefix = "[System] " if role == "system" else ""
-            return key, [(f"{prefix}{text}", uploads)], prev.metadata
+            return key, [_prefix_turn(role, text, uploads)], prev.metadata
 
     key = f"fp:{_fingerprint(messages)}"
     await sessions.get_or_new(key)
-    turns = []
-    for m in messages:
-        role, text, uploads = await message_to_turn(http, m)
-        if role in ("assistant", "tool"):
-            continue
-        prefix = "[System] " if role == "system" else ""
-        turns.append((f"{prefix}{text}", uploads))
-    return key, turns or [(" ", [])], []
+    return key, await _fresh_turns(http, messages), []
 
 
 async def _pick_account(
-    pool: AccountPool, sessions: SessionStore, key: str
-) -> tuple[int, list]:
+    pool: AccountPool,
+    sessions: SessionStore,
+    key: str,
+) -> tuple[int, list[str | None]]:
     """Sticky account per conversation state; fresh round-robin otherwise."""
     state = await sessions.get(key)
     if state is not None and state.account is not None:
@@ -386,301 +628,462 @@ async def _pick_account(
     idx, _ = pool.pick()
     st, _ = await sessions.get_or_new(key)
     st.account = idx
+    await sessions.persist(key)
     return idx, st.metadata
 
 
 async def _save_state(
-    sessions: SessionStore, key: str, account: int, metadata: list, full_fp: str | None = None
+    sessions: SessionStore,
+    key: str,
+    account: int,
+    metadata: list[str | None],
+    full_fp: str | None = None,
 ) -> None:
+    """Record the account and Gemini continuation metadata for a key."""
     state, _ = await sessions.get_or_new(key)
     state.account = account
     state.metadata = metadata
+    await sessions.persist(key)
     if full_fp:
         await sessions.link(f"fp:{full_fp}", key)
 
 
 # ------------------------------------------------------- chat completions ---
 
-async def _chat_payload(
-    req: Request, body: dict
-) -> tuple[str | None, bool, list[dict], str | None]:
-    model = body.get("model")
-    stream = bool(body.get("stream", False))
-    messages = body.get("messages") or []
-    conversation_id = body.get("conversation_id")
-    return model, stream, messages, conversation_id
+
+class ChatPayload(NamedTuple):
+    """Validated chat-completions request fields."""
+
+    model: str | None
+    stream: bool
+    messages: JsonList
+    conversation_id: str | None
 
 
-async def _handle_chat(req: Request, body: dict) -> Any:
+async def _chat_payload(req: Request) -> ChatPayload:
+    """Parse and validate a chat-completions request body."""
+    body = await req.json()
+    raw_messages = body.get("messages") or []
+    messages = [m for m in raw_messages if isinstance(m, dict)]
+    return ChatPayload(
+        model=body.get("model") if isinstance(body.get("model"), str) else None,
+        stream=bool(body.get("stream", False)),
+        messages=messages,
+        conversation_id=body.get("conversation_id")
+        if isinstance(body.get("conversation_id"), str)
+        else None,
+    )
+
+
+async def _resolve_chat_turns(
+    http: httpx.AsyncClient,
+    sessions: SessionStore,
+    messages: JsonList,
+    conversation_id: str | None,
+) -> ChatLocked:
+    """Resolve the conversation key and new turns, validating trailing roles."""
+    key = f"conv:{conversation_id}" if conversation_id else None
+    if key is None:
+        try:
+            key, turns, resume_meta = await _chat_turns(
+                http,
+                sessions,
+                messages,
+                conversation_id,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            raise ValueError(msg) from exc
+        if not turns:
+            msg = "no turns to send"
+            raise ValueError(msg)
+        return ChatLocked(key, turns, resume_meta, messages)
+    if messages[-1].get("role", "user") in ("assistant", "tool"):
+        # Stateless validation first: trailing assistant/tool carries nothing
+        # new, regardless of whether server-side history exists yet.
+        msg = "last message has role assistant/tool; nothing new to send"
+        raise ValueError(msg)
+    return ChatLocked(key, [], [], messages)
+
+
+async def _handle_chat(req: Request) -> HandlerResult:
+    """Handle a chat-completions request, streaming or buffered."""
     pool, sessions, http = _pool(req), _sessions(req), _http(req)
-    model_name, stream, messages, conversation_id = await _chat_payload(req, body)
+    try:
+        payload = await _chat_payload(req)
+    except (ValueError, AttributeError):
+        return _err(400, "invalid JSON body", "invalid_request_error")
+    model_name, stream, messages, conversation_id = payload
     if not messages:
         return _err(400, "messages is required", "invalid_request_error")
     model, thinking = _resolve_model(pool, model_name)
 
     # Resolve key first (cheap), then serialize everything account-touching.
-    key = f"conv:{conversation_id}" if conversation_id else None
-    if key is None:
-        try:
-            key, turns, resume_meta = await _chat_turns(http, sessions, messages, conversation_id)
-        except ValueError as exc:
-            return _err(400, str(exc), "invalid_request_error")
-        if not turns:
-            return _err(400, "no turns to send", "invalid_request_error")
-    else:
-        # Stateless validation first: trailing assistant/tool carries nothing new,
-        # regardless of whether server-side history exists yet.
-        last_role = (messages[-1].get("role", "user") if isinstance(messages[-1], dict) else "user")
-        if last_role in ("assistant", "tool"):
-            return _err(400, "last message has role assistant/tool; nothing new to send", "invalid_request_error")
-    convo_lock = await sessions.lock_for(key)
+    try:
+        resolved = await _resolve_chat_turns(http, sessions, messages, conversation_id)
+    except ValueError as exc:
+        return _err(400, str(exc), "invalid_request_error")
+    convo_lock = await sessions.lock_for(resolved.key)
     async with convo_lock:
+        key, turns, resume_meta = resolved.key, resolved.turns, resolved.resume_meta
         if conversation_id:
             try:
-                key, turns, resume_meta = await _chat_turns(http, sessions, messages, conversation_id)
+                key, turns, resume_meta = (
+                    await _chat_turns(http, sessions, messages, conversation_id)
+                )[0:3]
             except ValueError as exc:
                 return _err(400, str(exc), "invalid_request_error")
             if not turns:
                 return _err(400, "no turns to send", "invalid_request_error")
-        return await _handle_chat_locked(req, pool, sessions, http, key, turns, resume_meta, model_name, model, thinking, stream, messages)
+        return await _handle_chat_locked(
+            pool,
+            sessions,
+            http,
+            ChatLocked(key, turns, resume_meta, messages),
+            LockedModels(model_name, model, thinking, stream),
+        )
 
 
-async def _handle_chat_locked(req: Request, pool: AccountPool, sessions: SessionStore, http: httpx.AsyncClient, key: str, turns: list, resume_meta: list, model_name: str | None, model: str | None, thinking: bool, stream: bool, messages: list) -> Any:
+class ChatLocked(NamedTuple):
+    """Resolved chat conversation plus the turns to send through Gemini."""
+
+    key: str
+    turns: list[Turn]
+    resume_meta: list[str | None]
+    messages: JsonList
+
+
+class ChatRunContext(NamedTuple):
+    """Everything a chat run needs beyond resolved turns."""
+
+    account: int
+    metadata: list[str | None]
+    model_name: str | None
+    model: str | None
+    prompt_for_usage: str
+    thinking: bool
+
+
+async def _buffered_chat(
+    pool: AccountPool,
+    sessions: SessionStore,
+    http: httpx.AsyncClient,
+    resolved: ChatLocked,
+    ctx: ChatRunContext,
+) -> HandlerResult:
+    """Run turns and persist the completed chat-completion object."""
+    key, turns, _, messages = resolved
+    try:
+        out, new_meta = await _run_turns(
+            pool,
+            RunRequest(ctx.account, ctx.model, ctx.thinking, turns, ctx.metadata),
+        )
+    except (
+        GeminiError,
+        AuthError,
+        APIError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ) as exc:
+        code, msg = _map_exception(exc)
+        return _err(code, msg)
+    md = await _gemini_images_to_markdown(http, out)
+    text = _full_text(out) + md
+    thoughts = _thoughts(out)
+    await _save_state(sessions, key, ctx.account, new_meta, _fingerprint(messages))
+    return _chat_completion(ctx.model_name, key, text, thoughts, ctx.prompt_for_usage)
+
+
+async def _stream_chat(
+    pool: AccountPool,
+    sessions: SessionStore,
+    http: httpx.AsyncClient,
+    resolved: ChatLocked,
+    ctx: ChatRunContext,
+) -> AsyncIterator[str]:
+    """Stream chat deltas, persisting completion state on the done event."""
+    key, turns, _, messages = resolved
+    cid = _new_id("chatcmpl-")
+    state: Json = {"sent_role": False, "full": ""}
+    try:
+        async for kind, payload in _run_turns_stream(
+            pool,
+            RunRequest(
+                ctx.account,
+                ctx.model,
+                ctx.thinking,
+                turns,
+                ctx.metadata,
+            ),
+        ):
+            if kind == "delta" and isinstance(payload, str):
+                async for frame in _chat_delta_frames(
+                    cid,
+                    ctx.model_name,
+                    payload,
+                    state,
+                ):
+                    yield frame
+            elif kind == "done" and isinstance(payload, tuple):
+                out, new_meta = payload
+                if not isinstance(new_meta, list):
+                    continue
+                if not isinstance(out, ModelOutput):
+                    await _save_state(sessions, key, ctx.account, new_meta)
+                    continue
+                async for frame in _chat_done_frames(
+                    http,
+                    sessions,
+                    ChatDoneContext(
+                        cid,
+                        key,
+                        ctx.account,
+                        new_meta,
+                        messages,
+                        ctx.model_name,
+                        ctx.prompt_for_usage,
+                        out,
+                    ),
+                    state,
+                ):
+                    yield frame
+    except (
+        GeminiError,
+        AuthError,
+        APIError,
+        httpx.HTTPError,
+        OSError,
+    ) as exc:
+        yield _sse({"error": {"message": str(exc) or type(exc).__name__}})
+    yield "data: [DONE]\n\n"
+
+
+class LockedModels(NamedTuple):
+    """Model selection for a locked conversation run."""
+
+    model_name: str | None
+    model: str | None
+    thinking: bool
+    stream: bool
+
+
+async def _handle_chat_locked(
+    pool: AccountPool,
+    sessions: SessionStore,
+    http: httpx.AsyncClient,
+    resolved: ChatLocked,
+    models: LockedModels,
+) -> HandlerResult:
+    key, turns, resume_meta, _ = resolved
     account, metadata = await _pick_account(pool, sessions, key)
     if resume_meta:
         metadata = resume_meta
     prompt_for_usage = "\n".join(t for t, _ in turns)
+    ctx = ChatRunContext(
+        account,
+        metadata,
+        models.model_name,
+        models.model,
+        prompt_for_usage,
+        models.thinking,
+    )
+    if not models.stream:
+        return await _buffered_chat(pool, sessions, http, resolved, ctx)
 
-    if not stream:
-        try:
-            out, new_meta = await _run_turns(pool, account, model, thinking, turns, metadata)
-        except Exception as exc:
-            code, msg = _map_exception(exc)
-            return _err(code, msg)
-        md = await _gemini_images_to_markdown(http, out)
-        text = _full_text(out) + md
-        thoughts = _thoughts(out)
-        await _save_state(sessions, key, account, new_meta, _fingerprint(messages))
-        msg: dict[str, Any] = {"role": "assistant", "content": text}
-        if thoughts:
-            msg["reasoning_content"] = thoughts
-        return {
-            "id": _new_id("chatcmpl-"),
-            "object": "chat.completion",
-            "created": _now(),
-            "model": model_name or "gemini-flash",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": msg,
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": _usage(prompt_for_usage, text),
-            "conversation_id": key[5:] if key.startswith("conv:") else None,
-        }
-
-    async def gen():
-        cid = _new_id("chatcmpl-")
-        sent_role = False
-        full = ""
-        try:
-            async for kind, payload in _run_turns_stream(
-                pool, account, model, thinking, turns, metadata
-            ):
-                if kind == "delta":
-                    if not sent_role:
-                        sent_role = True
-                        yield _sse(
-                            {
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": _now(),
-                                "model": model_name or "gemini-flash",
-                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-                            }
-                        )
-                    full += payload
-                    yield _sse(
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": _now(),
-                            "model": model_name or "gemini-flash",
-                            "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
-                        }
-                    )
-                else:
-                    out, new_meta = payload
-                    md = await _gemini_images_to_markdown(http, out)
-                    if md:
-                        full += md
-                        yield _sse(
-                            {
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": _now(),
-                                "model": model_name or "gemini-flash",
-                                "choices": [{"index": 0, "delta": {"content": md}, "finish_reason": None}],
-                            }
-                        )
-                    await _save_state(sessions, key, account, new_meta, _fingerprint(messages))
-                    yield _sse(
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": _now(),
-                            "model": model_name or "gemini-flash",
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                            "usage": _usage(prompt_for_usage, full),
-                        }
-                    )
-        except Exception as exc:
-            yield _sse({"error": {"message": str(exc) or type(exc).__name__}})
-        yield "data: [DONE]\n\n"
+    async def gen() -> AsyncIterator[str]:
+        async for frame in _stream_chat(pool, sessions, http, resolved, ctx):
+            yield frame
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-def _sse(obj: dict) -> str:
+def _sse(obj: Json) -> str:
+    """Encode one server-sent-events data frame."""
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(req: Request):
+@app.post("/v1/chat/completions", response_model=None)
+@app.post("/chat/completions", response_model=None)
+async def chat_completions(req: Request) -> HandlerResult:
+    """Create a chat completion; JSON errors stay JSON, never exceptions."""
     try:
-        body = await req.json()
-    except Exception:
+        return await _handle_chat(req)
+    except (ValueError, AttributeError, KeyError):
         return _err(400, "invalid JSON body", "invalid_request_error")
-    return await _handle_chat(req, body)
 
 
 # ------------------------------------------------------------- responses ---
 
-def _norm_input_item(item: Any) -> str:
+
+def _norm_input_item(item: Json | str | float | None) -> str:
+    """Normalize one Responses input item for prefix-overlap comparison."""
     if not isinstance(item, dict):
         return json.dumps(item, sort_keys=True, default=str)
     itype = item.get("type", "message")
     if itype != "message":
-        return json.dumps({k: item.get(k) for k in ("type", "id")}, sort_keys=True, default=str)
+        return json.dumps(
+            {k: item.get(k) for k in ("type", "id")},
+            sort_keys=True,
+            default=str,
+        )
     parts: list[str] = []
     for p in item.get("content", []) or []:
         if not isinstance(p, dict):
             continue
         if p.get("type") in ("input_text", "output_text", "text"):
-            parts.append(p.get("text", ""))
+            text = p.get("text", "")
+            parts.append(text if isinstance(text, str) else "")
         else:
             parts.append(part_identity(p))
     return f"{item.get('role', '')}:{('|'.join(parts))}"
 
 
+def _prefix_overlap(prev_norm: list[str], new_norm: list[str]) -> int:
+    """Count the shared leading items between stored and incoming norms."""
+    cut = 0
+    for a, b in zip(prev_norm, new_norm, strict=False):
+        if a != b:
+            break
+        cut += 1
+    return cut
+
+
+async def _items_to_turns(
+    http: httpx.AsyncClient,
+    items: JsonList,
+    *,
+    skip_roles: tuple[str, ...] = ("assistant", "tool"),
+) -> list[Turn]:
+    """Convert Responses items to user turns, dropping echoed roles."""
+    turns: list[Turn] = []
+    for it in items:
+        role, text, uploads = await message_to_turn(
+            http,
+            {"role": it.get("role", "user"), "content": it.get("content", "")},
+        )
+        if role in skip_roles:
+            for up, _ in uploads:
+                up.cleanup()
+            continue
+        turns.append((text, uploads))
+    return turns
+
+
+def _with_instructions(turns: list[Turn], instructions: str | None) -> list[Turn]:
+    """Prepend system instructions to a turn list when present."""
+    if instructions:
+        return [(f"[System] {instructions}", []), *turns]
+    return turns
+
+
+class ResponseTurns(NamedTuple):
+    """Inputs for resolving Responses turns against stored history."""
+
+    items: JsonList
+    instructions: str | None
+    prev_response_id: str | None
+    conversation: str | None
+
+
+async def _fresh_response_turns(
+    http: httpx.AsyncClient,
+    items: JsonList,
+    instructions: str | None,
+) -> list[Turn]:
+    """Build turns for a brand-new Responses conversation key."""
+    return _with_instructions(
+        await _items_to_turns(http, items, skip_roles=("assistant",)),
+        instructions,
+    ) or [(" ", [])]
+
+
 async def _responses_turns(
     http: httpx.AsyncClient,
     sessions: SessionStore,
-    items: list[dict],
-    instructions: str | None,
-    prev_response_id: str | None,
-    conversation: str | None,
-) -> tuple[str, list[tuple[str, list]], list, str | None]:
+    request: ResponseTurns,
+) -> tuple[str, list[Turn], list[str | None], str | None]:
     """Resolve (state_key, NEW turns only, resume metadata, prev text) for Responses.
 
     Resumed server-side history is never replayed: only trailing items not
     already covered by the stored input norm are sent.
     """
+    items, instructions, prev_response_id, conversation = request
     if conversation:
         key = f"conv:{conversation}"
         state, created = await sessions.get_or_new(key)
         if not created and state.metadata:
             prev_norm: list[str] = (await sessions.get_norm(key)) or []
-            new_norm = [_norm_input_item(i) for i in items]
-            cut = 0
-            for a, b in zip(prev_norm, new_norm):
-                if a != b:
-                    break
-                cut += 1
-            fresh = items[cut:]
-            turns = []
-            for it in fresh:
-                role, text, uploads = await message_to_turn(
-                    http, {"role": it.get("role", "user"), "content": it.get("content", "")}
-                )
-                if role in ("assistant", "tool"):
-                    for up, _ in uploads:
-                        up.cleanup()
-                    continue
-                turns.append((text, uploads))
-            if instructions:
-                turns.insert(0, (f"[System] {instructions}", []))
-            return key, turns, state.metadata, None
-        turns = []
-        if instructions:
-            turns.append((f"[System] {instructions}", []))
-        for it in items:
-            role, text, uploads = await message_to_turn(
-                http, {"role": it.get("role", "user"), "content": it.get("content", "")}
+            cut = _prefix_overlap(prev_norm, [_norm_input_item(i) for i in items])
+            turns = _with_instructions(
+                await _items_to_turns(http, items[cut:]),
+                instructions,
             )
-            if role == "assistant":
-                continue
-            turns.append((text, uploads))
-        return key, turns or [(" ", [])], [], None
+            return key, turns, state.metadata, None
+        return key, await _fresh_response_turns(http, items, instructions), [], None
 
     if prev_response_id:
         saved = await sessions.get_response(prev_response_id)
-        if saved and saved.get("_state"):
+        if saved and isinstance(saved.get("_state"), str):
             key = saved["_state"]
             state = await sessions.get(key)
             old_norm = saved.get("_norm") or []
-            new_norm = [_norm_input_item(i) for i in items]
-            cut = 0
-            for a, b in zip(old_norm, new_norm):
-                if a != b:
-                    break
-                cut += 1
-            fresh = items[cut:]
-            turns = []
-            for it in fresh:
-                role, text, uploads = await message_to_turn(
-                    http, {"role": it.get("role", "user"), "content": it.get("content", "")}
-                )
-                if role in ("assistant", "tool"):
-                    for up, _ in uploads:
-                        up.cleanup()
-                    continue
-                turns.append((text, uploads))
-            if instructions:
-                turns.insert(0, (f"[System] {instructions}", []))
-            return key, turns, (state.metadata if state else []), saved.get("_text")
+            old_list = old_norm if isinstance(old_norm, list) else []
+            cut = _prefix_overlap(old_list, [_norm_input_item(i) for i in items])
+            turns = _with_instructions(
+                await _items_to_turns(http, items[cut:]),
+                instructions,
+            )
+            prev_text = saved.get("_text")
+            return (
+                key,
+                turns,
+                (state.metadata if state else []),
+                prev_text if isinstance(prev_text, str) else None,
+            )
 
-    key = f"resp:{uuid.uuid4().hex[:16]}:{hashlib.sha256('|'.join(_norm_input_item(i) for i in items).encode()).hexdigest()[:12]}"
+    key = _response_key(items)
     await sessions.get_or_new(key)
-    turns = []
-    if instructions:
-        turns.append((f"[System] {instructions}", []))
-    for it in items:
-        role, text, uploads = await message_to_turn(
-            http, {"role": it.get("role", "user"), "content": it.get("content", "")}
-        )
-        if role == "assistant":
-            continue
-        turns.append((text, uploads))
-    return key, turns or [(" ", [])], [], None
+    return key, await _fresh_response_turns(http, items, instructions), [], None
+
+
+def _response_key(items: JsonList) -> str:
+    """Build a fresh Responses conversation key from normalized input."""
+    digest = hashlib.sha256(
+        "|".join(_norm_input_item(i) for i in items).encode(),
+    ).hexdigest()[:12]
+    return f"resp:{uuid.uuid4().hex[:16]}:{digest}"
+
+
+def _prompt_response_key(prompt: str) -> str:
+    """Build a fresh Responses conversation key from a raw string prompt."""
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    return f"resp:{uuid.uuid4().hex[:16]}:{digest}"
+
+
+class ResponseContent(NamedTuple):
+    """Fields for building one Responses object."""
+
+    rid: str
+    model_name: str | None
+    text: str
+    conv_id: str
+    prev_id: str | None
+    prompt: str
+    key: str
+    items: JsonList
 
 
 def _response_object(
-    rid: str,
-    model_name: str,
-    text: str,
-    conv_id: str,
-    prev_id: str | None,
-    prompt: str,
+    content: ResponseContent,
     status: str = "completed",
-) -> dict:
+) -> dict[str, Any]:
+    """Build the public Responses object for one completed turn."""
     return {
-        "id": rid,
+        "id": content.rid,
         "object": "response",
         "created_at": _now(),
-        "model": model_name or "gemini-flash",
+        "model": content.model_name or "gemini-flash",
         "status": status,
         "output": [
             {
@@ -688,148 +1091,408 @@ def _response_object(
                 "id": _new_id("msg_"),
                 "status": status,
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
-            }
+                "content": [
+                    {"type": "output_text", "text": content.text, "annotations": []},
+                ],
+            },
         ],
         "usage": {
-            "input_tokens": max(1, len(prompt) // 4),
-            "output_tokens": max(1, len(text) // 4),
-            "total_tokens": max(2, (len(prompt) + len(text)) // 4),
+            "input_tokens": max(1, len(content.prompt) // 4),
+            "output_tokens": max(1, len(content.text) // 4),
+            "total_tokens": max(2, (len(content.prompt) + len(content.text)) // 4),
         },
-        "conversation": {"id": conv_id},
-        "previous_response_id": prev_id,
+        "conversation": {"id": content.conv_id},
+        "previous_response_id": content.prev_id,
     }
 
 
-async def _handle_responses(req: Request, body: dict) -> Any:
-    pool, sessions, http = _pool(req), _sessions(req), _http(req)
-    model_name = body.get("model")
+def _save_response_obj(content: ResponseContent) -> dict[str, Any]:
+    """Build a response object plus its private chaining fields."""
+    obj = _response_object(content)
+    obj["_state"] = content.key
+    obj["_text"] = content.text
+    obj["_norm"] = [_norm_input_item(i) for i in content.items]
+    return obj
+
+
+def _response_event(
+    event: str,
+    response: dict[str, Any],
+    model_name: str | None,
+) -> str:
+    """Encode a Responses lifecycle event (created) as an SSE frame."""
+    body = {
+        "type": event,
+        "response": {**response, "model": model_name or "gemini-flash"},
+    }
+    return f"event: {event}\ndata: {json.dumps(body)}\n\n"
+
+
+def _delta_event(rid: str, delta: str) -> str:
+    """Encode a Responses output-text delta as an SSE frame."""
+    body = {
+        "type": "response.output_text.delta",
+        "item_id": rid,
+        "delta": delta,
+    }
+    return f"event: response.output_text.delta\ndata: {json.dumps(body)}\n\n"
+
+
+def _completed_event(response: dict[str, Any]) -> str:
+    """Encode a completed Responses object as an SSE frame."""
+    body = {"type": "response.completed", "response": response}
+    return f"event: response.completed\ndata: {json.dumps(body)}\n\n"
+
+
+def _failed_event(exc: BaseException) -> str:
+    """Encode a Responses failure as an SSE frame."""
+    body = {"type": "response.failed", "error": str(exc)}
+    return f"event: response.failed\ndata: {json.dumps(body)}\n\n"
+
+
+class ResponsesPayload(NamedTuple):
+    """Validated Responses request fields."""
+
+    model: str | None
+    raw_input: str | list[Json]
+    instructions: str | None
+    prev_id: str | None
+    conv_id: str | None
+    stream: bool
+    thinking: bool
+    resolved_model: str | None
+
+
+async def _responses_payload(req: Request, pool: AccountPool) -> ResponsesPayload:
+    """Parse and validate a Responses request body."""
+    body = await req.json()
     raw_input = body.get("input", "")
+    model = body.get("model") if isinstance(body.get("model"), str) else None
     instructions = body.get("instructions")
     prev_id = body.get("previous_response_id")
     conv_param = body.get("conversation")
     conv_id = conv_param.get("id") if isinstance(conv_param, dict) else conv_param
-    stream = bool(body.get("stream", False))
-    model, thinking = _resolve_model(pool, model_name)
+    resolved, thinking = _resolve_model(pool, model)
+    return ResponsesPayload(
+        model=model,
+        raw_input=raw_input if isinstance(raw_input, str | list) else "",
+        instructions=instructions if isinstance(instructions, str) else None,
+        prev_id=prev_id if isinstance(prev_id, str) else None,
+        conv_id=conv_id if isinstance(conv_id, str) else None,
+        stream=bool(body.get("stream", False)),
+        thinking=thinking,
+        resolved_model=resolved,
+    )
 
+
+def _response_items(raw_input: str | list[Json]) -> list[dict[str, Any]]:
+    """Coerce Responses input to a list of message dicts."""
     if isinstance(raw_input, str):
-        prompt: str = raw_input
-        items: list[dict] = []
-        if prev_id or conv_id:
-            as_items = (
-                [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}]
-                if prompt.strip()
-                else []
-            )
-            items = as_items
-            pre_turns: list | None = None
-            key = None
-        else:
-            pre_key = f"resp:{uuid.uuid4().hex[:16]}:{hashlib.sha256(prompt.encode()).hexdigest()[:12]}"
-            pre_turns = ([(f"[System] {instructions}\n\n{prompt}", [])] if instructions else [(prompt, [])])
-            key = pre_key
-            await sessions.get_or_new(key)
-            turns, resume_meta = pre_turns, []
-    else:
-        items = list(raw_input or [])
-        pre_turns = None
-        key = None
+        return []
+    return [i for i in raw_input if isinstance(i, dict)]
 
-    if key is None:
-        # Stateless validation: empty item list never reaches Gemini.
-        if not items and pre_turns is None:
-            return _err(400, "no input items to send", "invalid_request_error")
-        # Peek the key without downloading files: derive from stored norm state.
-        if conv_id:
-            key = f"conv:{conv_id}"
-        elif prev_id:
-            saved = await sessions.get_response(prev_id)
-            key = saved.get("_state") if saved and saved.get("_state") else f"pending:{prev_id}"
-        else:
-            key = f"resp:{uuid.uuid4().hex[:16]}:{hashlib.sha256('|'.join(_norm_input_item(i) for i in items).encode()).hexdigest()[:12]}"
+
+class ResolvedResponses(NamedTuple):
+    """Validated Responses inputs plus the resolved conversation key."""
+
+    items: JsonList
+    key: str | None
+    pre_turns: list[Turn] | None
+    turns: list[Turn]
+    resume_meta: list[str | None]
+
+
+def _prompt_items(prompt: str) -> JsonList:
+    """Wrap a raw string prompt as a single Responses user message."""
+    if not prompt.strip():
+        return []
+    return [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        },
+    ]
+
+
+async def _resolve_responses_inputs(
+    sessions: SessionStore,
+    payload: ResponsesPayload,
+) -> ResolvedResponses:
+    """Resolve Responses payload to items, key, and pre-built string turns."""
+    raw_input = payload.raw_input
+    if isinstance(raw_input, str):
+        prompt = raw_input
+        if payload.prev_id or payload.conv_id:
+            return ResolvedResponses(_prompt_items(prompt), None, None, [], [])
+        pre_key = _prompt_response_key(prompt)
+        pre_turns = (
+            [(f"[System] {payload.instructions}\n\n{prompt}", [])]
+            if payload.instructions
+            else [(prompt, [])]
+        )
+        await sessions.get_or_new(pre_key)
+        return ResolvedResponses([], pre_key, pre_turns, pre_turns, [])
+    return ResolvedResponses(_response_items(raw_input), None, None, [], [])
+
+
+async def _resolve_responses_key(
+    sessions: SessionStore,
+    payload: ResponsesPayload,
+    resolved: ResolvedResponses,
+) -> str:
+    """Peek the conversation key without downloading files."""
+    if resolved.key is not None:
+        return resolved.key
+    if not resolved.items and resolved.pre_turns is None:
+        msg = "no input items to send"
+        raise ValueError(msg)
+    if payload.conv_id:
+        return f"conv:{payload.conv_id}"
+    if payload.prev_id:
+        saved = await sessions.get_response(payload.prev_id)
+        state_key = saved.get("_state") if saved else None
+        return state_key if isinstance(state_key, str) else f"pending:{payload.prev_id}"
+    return _response_key(resolved.items)
+
+
+async def _handle_responses(req: Request) -> HandlerResult:
+    """Handle a Responses request, streaming or buffered."""
+    pool, sessions, http = _pool(req), _sessions(req), _http(req)
+    try:
+        payload = await _responses_payload(req, pool)
+    except (ValueError, AttributeError):
+        return _err(400, "invalid JSON body", "invalid_request_error")
+    try:
+        resolved = await _resolve_responses_inputs(sessions, payload)
+        key = await _resolve_responses_key(sessions, payload, resolved)
+    except ValueError as exc:
+        return _err(400, str(exc), "invalid_request_error")
+    items, pre_turns = resolved.items, resolved.pre_turns
+    turns, resume_meta = resolved.turns, resolved.resume_meta
     convo_lock = await sessions.lock_for(key)
     async with convo_lock:
         if pre_turns is None:
             try:
                 key, turns, resume_meta, _ = await _responses_turns(
-                    http, sessions, items, instructions, prev_id, conv_id
+                    http,
+                    sessions,
+                    ResponseTurns(
+                        items,
+                        payload.instructions,
+                        payload.prev_id,
+                        payload.conv_id,
+                    ),
                 )
             except ValueError as exc:
                 return _err(400, str(exc), "invalid_request_error")
         if not turns:
             return _err(400, "no input items to send", "invalid_request_error")
-        return await _handle_responses_locked(req, pool, sessions, http, key, turns, resume_meta, items, model_name, model, thinking, stream, instructions, prev_id)
+        return await _handle_responses_locked(
+            pool,
+            sessions,
+            http,
+            LockedTurns(key, turns, resume_meta, items),
+            LockedResponseModels(
+                payload.model,
+                payload.resolved_model,
+                payload.stream,
+                payload.prev_id,
+                payload.thinking,
+            ),
+        )
 
 
-async def _handle_responses_locked(req: Request, pool: AccountPool, sessions: SessionStore, http: httpx.AsyncClient, key: str, turns: list, resume_meta: list, items: list, model_name: str | None, model: str | None, thinking: bool, stream: bool, instructions: str | None, prev_id: str | None) -> Any:
+class LockedTurns(NamedTuple):
+    """Resolved conversation key plus the turns to send through Gemini."""
+
+    key: str
+    turns: list[Turn]
+    resume_meta: list[str | None]
+    items: JsonList
+
+
+class BufferedContext(NamedTuple):
+    """Everything a buffered Responses run needs beyond resolved turns."""
+
+    account: int
+    metadata: list[str | None]
+    model_name: str | None
+    model: str | None
+    conv_out: str
+    prev_id: str | None
+    prompt_for_usage: str
+    thinking: bool
+
+
+async def _buffered_response(
+    pool: AccountPool,
+    sessions: SessionStore,
+    http: httpx.AsyncClient,
+    resolved: LockedTurns,
+    ctx: BufferedContext,
+) -> HandlerResult:
+    """Run turns and persist the completed Responses object."""
+    key, turns, _, items = resolved
+    rid = _new_id("resp_")
+    try:
+        out, new_meta = await _run_turns(
+            pool,
+            RunRequest(ctx.account, ctx.model, ctx.thinking, turns, ctx.metadata),
+        )
+    except (
+        GeminiError,
+        AuthError,
+        APIError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ) as exc:
+        code, msg = _map_exception(exc)
+        return _err(code, msg)
+    md = await _gemini_images_to_markdown(http, out)
+    text = _full_text(out) + md
+    await _save_state(sessions, key, ctx.account, new_meta)
+    await sessions.set_norm(key, [_norm_input_item(i) for i in items])
+    obj = _save_response_obj(
+        ResponseContent(
+            rid,
+            ctx.model_name,
+            text,
+            ctx.conv_out,
+            ctx.prev_id,
+            ctx.prompt_for_usage,
+            key,
+            items,
+        ),
+    )
+    await sessions.save_response(rid, obj)
+    return {k: v for k, v in obj.items() if not k.startswith("_")}
+
+
+class LockedResponseModels(NamedTuple):
+    """Model selection for a locked Responses run."""
+
+    model_name: str | None
+    model: str | None
+    stream: bool
+    prev_id: str | None
+    thinking: bool
+
+
+async def _handle_responses_locked(
+    pool: AccountPool,
+    sessions: SessionStore,
+    http: httpx.AsyncClient,
+    resolved: LockedTurns,
+    models: LockedResponseModels,
+) -> HandlerResult:
+    key, turns, resume_meta, items = resolved
     account, metadata = await _pick_account(pool, sessions, key)
     if resume_meta:
         metadata = resume_meta
     prompt_for_usage = "\n".join(t for t, _ in turns)
-    conv_out = key[5:] if key.startswith("conv:") else key
+    conv_out = key.removeprefix("conv:")
 
-    if not stream:
-        try:
-            out, new_meta = await _run_turns(pool, account, model, thinking, turns, metadata)
-        except Exception as exc:
-            code, msg = _map_exception(exc)
-            return _err(code, msg)
-        md = await _gemini_images_to_markdown(http, out)
-        text = _full_text(out) + md
-        await _save_state(sessions, key, account, new_meta)
-        await sessions.set_norm(key, [_norm_input_item(i) for i in items])
-        obj = _response_object(rid, model_name, text, conv_out, prev_id, prompt_for_usage)
-        obj["_state"] = key
-        obj["_text"] = text
-        obj["_norm"] = [_norm_input_item(i) for i in items]
-        await sessions.save_response(rid, obj)
-        return {k: v for k, v in obj.items() if not k.startswith("_")}
+    if not models.stream:
+        return await _buffered_response(
+            pool,
+            sessions,
+            http,
+            resolved,
+            BufferedContext(
+                account,
+                metadata,
+                models.model_name,
+                models.model,
+                conv_out,
+                models.prev_id,
+                prompt_for_usage,
+                models.thinking,
+            ),
+        )
 
-    async def gen():
+    async def gen() -> AsyncIterator[str]:
         rid = _new_id("resp_")
-        yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': rid, 'object': 'response', 'status': 'in_progress', 'model': model_name or 'gemini-flash'}})}\n\n"
+        yield _response_event(
+            "response.created",
+            {"id": rid, "object": "response", "status": "in_progress"},
+            models.model_name,
+        )
+
         full = ""
         try:
             async for kind, payload in _run_turns_stream(
-                pool, account, model, thinking, turns, metadata
+                pool,
+                RunRequest(
+                    account,
+                    models.model,
+                    models.thinking,
+                    turns,
+                    metadata,
+                ),
             ):
-                if kind == "delta":
+                if kind == "delta" and isinstance(payload, str):
                     full += payload
-                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': rid, 'delta': payload})}\n\n"
-                else:
+                    yield _delta_event(rid, payload)
+                elif kind == "done" and isinstance(payload, tuple):
                     out, new_meta = payload
-                    md = await _gemini_images_to_markdown(http, out)
+                    if not isinstance(new_meta, list):
+                        continue
+                    md = (
+                        await _gemini_images_to_markdown(http, out)
+                        if isinstance(
+                            out,
+                            ModelOutput,
+                        )
+                        else ""
+                    )
                     if md:
                         full += md
-                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'item_id': rid, 'delta': md})}\n\n"
+                        yield _delta_event(rid, md)
                     await _save_state(sessions, key, account, new_meta)
                     await sessions.set_norm(key, [_norm_input_item(i) for i in items])
-                    obj = _response_object(rid, model_name, full, conv_out, prev_id, prompt_for_usage)
-                    obj["_state"] = key
-                    obj["_text"] = full
-                    obj["_norm"] = [_norm_input_item(i) for i in items]
+                    obj = _save_response_obj(
+                        ResponseContent(
+                            rid,
+                            models.model_name,
+                            full,
+                            conv_out,
+                            models.prev_id,
+                            prompt_for_usage,
+                            key,
+                            items,
+                        ),
+                    )
                     await sessions.save_response(rid, obj)
                     public = {k: v for k, v in obj.items() if not k.startswith("_")}
-                    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': public})}\n\n"
-        except Exception as exc:
-            yield f"event: response.failed\ndata: {json.dumps({'type': 'response.failed', 'error': str(exc)})}\n\n"
+                    yield _completed_event(public)
+        except (
+            GeminiError,
+            AuthError,
+            APIError,
+            httpx.HTTPError,
+            OSError,
+        ) as exc:
+            yield _failed_event(exc)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@app.post("/v1/responses")
-@app.post("/responses")
-async def create_response(req: Request):
+@app.post("/v1/responses", response_model=None)
+@app.post("/responses", response_model=None)
+async def create_response(req: Request) -> HandlerResult:
+    """Create a response; JSON errors stay JSON, never exceptions."""
     try:
-        body = await req.json()
-    except Exception:
+        return await _handle_responses(req)
+    except (ValueError, AttributeError, KeyError):
         return _err(400, "invalid JSON body", "invalid_request_error")
-    return await _handle_responses(req, body)
 
 
-@app.get("/v1/responses/{rid}")
-@app.get("/responses/{rid}")
-async def get_response(req: Request, rid: str):
+@app.get("/v1/responses/{rid}", response_model=None)
+@app.get("/responses/{rid}", response_model=None)
+async def get_response(req: Request, rid: str) -> HandlerResult:
+    """Fetch one saved response object by id."""
     saved = await _sessions(req).get_response(rid)
     if not saved:
         return _err(404, f"response {rid} not found", "invalid_request_error")
@@ -838,28 +1501,35 @@ async def get_response(req: Request, rid: str):
 
 # ----------------------------------------------------------------- models ---
 
-@app.get("/v1/models")
-@app.get("/models")
-async def list_models(req: Request):
+
+@app.get("/v1/models", response_model=None)
+@app.get("/models", response_model=None)
+async def list_models(req: Request) -> Json:
+    """List registry models plus display-slug and flash aliases."""
     return {"object": "list", "data": _model_list(_pool(req))}
 
 
 # ------------------------------------------------------------------ files ---
 
-@app.post("/v1/files")
-async def upload_file(req: Request):
-    form = await req.form()
-    file = form.get("file")
-    purpose = str(form.get("purpose", "assistants"))
-    if file is None or not hasattr(file, "read"):
-        return _err(400, "file is required (multipart)", "invalid_request_error")
-    data = await file.read()
-    filename = getattr(file, "filename", None) or "upload.bin"
-    import mimetypes as _m
 
-    mime = _m.guess_type(filename)[0] or "application/octet-stream"
+@app.post("/v1/files", response_model=None)
+async def upload_file(req: Request) -> HandlerResult:
+    """Store an uploaded file; bytes persist in SQLite across restarts."""
+    form = await req.form()
+    upload = form.get("file")
+    purpose = form.get("purpose")
+    if not isinstance(upload, StarletteUploadFile):
+        return _err(400, "file is required (multipart)", "invalid_request_error")
+    data = await upload.read()
+    if not isinstance(data, bytes):
+        return _err(400, "file is required (multipart)", "invalid_request_error")
+    filename = upload.filename or "upload.bin"
+    purpose_str = purpose if isinstance(purpose, str) else "assistants"
+
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    stored_purpose = purpose_str or "assistants"
     try:
-        fid = UploadStore.put(data, mime, filename)
+        fid = UploadStore.put(data, mime, filename, stored_purpose)
     except ValueError as exc:
         return _err(413, str(exc), "invalid_request_error")
     return {
@@ -868,115 +1538,167 @@ async def upload_file(req: Request):
         "bytes": len(data),
         "created_at": _now(),
         "filename": filename,
-        "purpose": purpose,
+        "purpose": stored_purpose,
     }
 
 
-@app.get("/v1/files")
-async def list_files():
+@app.get("/v1/files", response_model=None)
+async def list_files() -> Json:
+    """List uploaded files, oldest first."""
     return {
         "object": "list",
         "data": [
-            {"id": fid, "object": "file", "bytes": len(b), "created_at": 0, "filename": fn, "purpose": "assistants"}
-            for fid, (b, _, fn) in UploadStore._files.items()
+            {
+                "id": fid,
+                "object": "file",
+                "bytes": size,
+                "created_at": created,
+                "filename": fn,
+                "purpose": purpose,
+            }
+            for fid, size, fn, purpose, created in UploadStore.list_all()
         ],
     }
 
 
-@app.get("/v1/files/{fid}")
-async def retrieve_file(fid: str):
+@app.get("/v1/files/{fid}", response_model=None)
+async def retrieve_file(fid: str) -> HandlerResult:
+    """Fetch one uploaded file's metadata by id."""
     stored = UploadStore.get(fid)
     if not stored:
         return _err(404, f"file {fid} not found", "invalid_request_error")
-    data, _, filename = stored
-    return {"id": fid, "object": "file", "bytes": len(data), "created_at": 0, "filename": filename, "purpose": "assistants"}
+    data, _, filename, purpose, created = stored
+    return {
+        "id": fid,
+        "object": "file",
+        "bytes": len(data),
+        "created_at": created,
+        "filename": filename,
+        "purpose": purpose,
+    }
 
 
-@app.delete("/v1/files/{fid}")
-async def delete_file(fid: str):
+@app.delete("/v1/files/{fid}", response_model=None)
+async def delete_file(fid: str) -> HandlerResult:
+    """Delete one uploaded file by id."""
     if not UploadStore.delete(fid):
         return _err(404, f"file {fid} not found", "invalid_request_error")
     return {"id": fid, "object": "file", "deleted": True}
 
 
-@app.get("/v1/files/{fid}/content")
-async def file_content(fid: str):
-    from fastapi.responses import Response as RawResponse
-
+@app.get("/v1/files/{fid}/content", response_model=None)
+async def file_content(fid: str) -> Response:
+    """Download one uploaded file's bytes by id."""
     stored = UploadStore.get(fid)
     if not stored:
         return _err(404, f"file {fid} not found", "invalid_request_error")
-    data, mime, _ = stored
-    return RawResponse(content=data, media_type=mime)
+    data, mime, _, _, _ = stored
+    return Response(content=data, media_type=mime)
 
 
 # ----------------------------------------------------------------- images ---
 
-async def _handle_image_gen(req: Request, body: dict) -> Any:
-    pool, sessions, http = _pool(req), _sessions(req), _http(req)
+
+async def _rehost_generated_image(
+    http: httpx.AsyncClient,
+    img: GeneratedImage | Image,
+    prompt: str,
+    idx: int,
+) -> dict[str, str] | None:
+    """Save one generated image and re-host it; fall back to the Gemini URL."""
+    url = (img.url or "").strip()
+    try:
+        path = await img.save(
+            path=str(IMG_TMP),
+            filename=f"gen_{uuid.uuid4().hex[:8]}",
+        )
+    except (OSError, ValueError, RuntimeError, httpx.HTTPError):
+        return {"url": url, "revised_prompt": prompt} if url else None
+    try:
+        raw = await asyncio.to_thread(Path(path).read_bytes)
+    except (OSError, ValueError, RuntimeError):
+        return {"url": url, "revised_prompt": prompt} if url else None
+    finally:
+        await asyncio.to_thread(Path(path).unlink, missing_ok=True)
+    public = (await freeimage.upload_png(http, raw, f"gemini_{idx}.png") or "").strip()
+    final = public or url
+    return {"url": final, "revised_prompt": prompt} if final else None
+
+
+async def _handle_image_gen(req: Request) -> HandlerResult:
+    """Generate images for a prompt and return re-hosted URLs."""
+    pool, http = _pool(req), _http(req)
+    try:
+        body = await req.json()
+    except (ValueError, AttributeError):
+        return _err(400, "invalid JSON body", "invalid_request_error")
     prompt = body.get("prompt", "")
-    if not prompt.strip():
+    if not isinstance(prompt, str) or not prompt.strip():
         return _err(400, "prompt is required", "invalid_request_error")
-    model_name = body.get("model")
+    model_name = body.get("model") if isinstance(body.get("model"), str) else None
     model, thinking = _resolve_model(pool, model_name)
-    key = f"img:{uuid.uuid4().hex[:16]}"
-    account, _ = await _pick_account(pool, sessions, key)
+    # Image gen is single-shot: plain round-robin, no durable session row.
+    account, _ = pool.pick()
     try:
         out, _ = await _run_turns(
-            pool, account, model, thinking, [(prompt, [])], []
+            pool,
+            RunRequest(account, model, thinking, [(prompt, [])], []),
         )
-    except Exception as exc:
+    except (
+        GeminiError,
+        AuthError,
+        APIError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ) as exc:
         code, msg = _map_exception(exc)
         return _err(code, msg)
-    imgs = list(getattr(out, "images", None) or [])
+    imgs = list(out.images or [])
     if not imgs:
         return _err(500, "Gemini returned no image for this prompt")
-    data: list[dict] = []
-    for idx, img in enumerate(imgs):
-        url = (getattr(img, "url", "") or "").strip()
-        try:
-            path = await img.save(path=str(IMG_TMP), filename=f"gen_{uuid.uuid4().hex[:8]}")
-            raw = Path(path).read_bytes()
-            try:
-                Path(path).unlink()
-            except OSError:
-                pass
-            public = (await freeimage.upload_png(http, raw, f"gemini_{idx}.png") or "").strip()
-            final = public or url
-            if final:
-                data.append({"url": final, "revised_prompt": prompt})
-        except Exception:
-            if url:
-                data.append({"url": url, "revised_prompt": prompt})
+    data = [
+        entry
+        for entry in await asyncio.gather(
+            *(
+                _rehost_generated_image(http, img, prompt, i)
+                for i, img in enumerate(imgs)
+            ),
+        )
+        if entry
+    ]
     if not data:
         return _err(500, "failed to retrieve generated image bytes")
     return {"created": _now(), "data": data}
 
 
-@app.post("/v1/images/generations")
-@app.post("/images/generations")
-async def image_generations(req: Request):
+@app.post("/v1/images/generations", response_model=None)
+@app.post("/images/generations", response_model=None)
+async def image_generations(req: Request) -> HandlerResult:
+    """Generate images; JSON errors stay JSON, never exceptions."""
     try:
-        body = await req.json()
-    except Exception:
+        return await _handle_image_gen(req)
+    except (ValueError, AttributeError, KeyError):
         return _err(400, "invalid JSON body", "invalid_request_error")
-    return await _handle_image_gen(req, body)
 
 
 # ------------------------------------------------------------------ misc ---
 
-@app.get("/health")
-@app.get("/")
-async def health(req: Request):
+
+@app.get("/health", response_model=None)
+@app.get("/", response_model=None)
+async def health(req: Request) -> Json:
+    """Report liveness plus account count and freeimage key presence."""
     try:
-        n = len(_pool(req)._entries)
-    except Exception:
+        n = _pool(req).client_count()
+    except (AttributeError, TypeError, ValueError):
         n = 0
     return {"status": "ok", "accounts": n, "freeimage": bool(freeimage_api_key())}
 
 
-@app.get("/v1/conversations/{cid}")
-async def get_conversation(req: Request, cid: str):
+@app.get("/v1/conversations/{cid}", response_model=None)
+async def get_conversation(req: Request, cid: str) -> HandlerResult:
+    """Report whether a conversation id has resumable Gemini history."""
     state = await _sessions(req).get(f"conv:{cid}")
     if state is None:
         return _err(404, f"conversation {cid} not found", "invalid_request_error")
@@ -986,4 +1708,4 @@ async def get_conversation(req: Request, cid: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)  # noqa: S104 - local dev shim binds all interfaces like before

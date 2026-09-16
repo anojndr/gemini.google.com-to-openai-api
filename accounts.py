@@ -1,3 +1,4 @@
+# Copyright 2026 gem2oai contributors.
 """Account pool: parse Netscape cookie blocks, round-robin GeminiClients.
 
 accounts.txt layout: free text with one Netscape cookie jar per ``` block.
@@ -10,16 +11,20 @@ import asyncio
 import itertools
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from gemini_webapi import GeminiClient
 
-_BLOCK_RE = re.compile(r"```\n(.*?)```", re.S)
+_BLOCK_RE = re.compile(r"```\n(.*?)```", re.DOTALL)
+_JAR_COLUMNS = 7
+_COOLDOWN_STRIKES = 3
 
 
 def _parse_cookie_block(block: str) -> dict[str, str]:
+    """Parse one Netscape cookie-jar block into a name -> value mapping."""
     cookies: dict[str, str] = {}
-    for line in block.splitlines():
-        line = line.strip()
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         if line.startswith("#HttpOnly"):
@@ -27,14 +32,14 @@ def _parse_cookie_block(block: str) -> dict[str, str]:
         elif line.startswith("#"):
             continue
         parts = line.split()
-        if len(parts) >= 7:
+        if len(parts) >= _JAR_COLUMNS:
             cookies[parts[5]] = parts[6]
     return cookies
 
 
 def load_account_cookies(path: str) -> list[dict[str, str]]:
     """Extract cookie dicts from every ``` jar block; skip blocks without auth."""
-    raw = open(path, encoding="utf-8", errors="replace").read()
+    raw = Path(path).read_text(encoding="utf-8", errors="replace")
     blocks = _BLOCK_RE.findall(raw)
     accounts = [_parse_cookie_block(b) for b in blocks]
     return [c for c in accounts if c.get("__Secure-1PSID")]
@@ -51,15 +56,17 @@ class _Entry:
 class AccountPool:
     """N load-balanced GeminiClients. One coroutine holds an account at a time."""
 
-    def __init__(self, cookie_dicts: list[dict[str, str]]):
+    def __init__(self, cookie_dicts: list[dict[str, str]]) -> None:
+        """Build one Gemini client per cookie jar."""
         if not cookie_dicts:
-            raise ValueError("No Gemini accounts found (need __Secure-1PSID per block)")
+            msg = "No Gemini accounts found (need __Secure-1PSID per block)"
+            raise ValueError(msg)
         self._entries = [
             _Entry(
                 GeminiClient(
                     secure_1psid=c.get("__Secure-1PSID"),
                     secure_1psidts=c.get("__Secure-1PSIDTS"),
-                )
+                ),
             )
             for c in cookie_dicts
         ]
@@ -75,41 +82,54 @@ class AccountPool:
             return_exceptions=True,
         )
         ok = 0
-        for entry, result in zip(self._entries, results):
-            if isinstance(result, Exception):
-                entry.failures = 3
+        for entry, result in zip(self._entries, results, strict=True):
+            if isinstance(result, BaseException):
+                entry.failures = _COOLDOWN_STRIKES
             else:
                 entry.live = True
                 ok += 1
         if not ok:
-            raise RuntimeError("No Gemini accounts initialized (all cookie jars failed)")
+            msg = "No Gemini accounts initialized (all cookie jars failed)"
+            raise RuntimeError(msg)
 
     async def close_all(self) -> None:
+        """Close every initialized account client."""
         await asyncio.gather(
             *(e.client.close() for e in self._entries if e.live),
             return_exceptions=True,
         )
 
+    def client_count(self) -> int:
+        """Return the number of configured accounts."""
+        return len(self._entries)
+
+    def client_at(self, index: int) -> GeminiClient:
+        """Return the Gemini client at a pool index."""
+        return self._entries[index].client
+
     def pick(self) -> tuple[int, GeminiClient]:
-        """Round-robin pick, skipping cooled-down accounts; all cooled -> reset one."""
+        """Round-robin pick, skipping cooled-down accounts; all cooled -> reset."""
         for _ in range(len(self._entries)):
             i = next(self._rr)
-            if self._entries[i].failures < 3:
+            if self._entries[i].failures < _COOLDOWN_STRIKES:
                 return i, self._entries[i].client
-        # Every account cooled down: forgive the next in rotation so recovery is possible.
+        # Every account cooled down: forgive next in rotation so recovery works.
         i = next(self._rr)
         self._entries[i].failures = 0
         return i, self._entries[i].client
 
     def lock_for(self, index: int) -> asyncio.Lock:
+        """Return the per-account lock serializing one account's turns."""
         return self._entries[index].lock
 
-    def report(self, index: int, ok: bool) -> None:
+    def report(self, index: int, *, ok: bool) -> None:
+        """Record success (reset strikes) or failure (add one strike)."""
         e = self._entries[index]
         e.failures = 0 if ok else e.failures + 1
 
-    def models(self) -> list[dict]:
-        seen: dict[str, dict] = {}
+    def models(self) -> list[dict[str, object]]:
+        """List deduplicated registry models across accounts."""
+        seen: dict[str, dict[str, object]] = {}
         for e in self._entries:
             for m in e.client.list_models() or []:
                 seen.setdefault(
@@ -121,10 +141,10 @@ class AccountPool:
                         "owned_by": "gemini",
                     },
                 )
-        return sorted(seen.values(), key=lambda m: m["id"])
+        return [seen[k] for k in sorted(seen)]
 
     def resolve(self, name: str | None) -> str | None:
-        """Resolve an OpenAI-style model name to a Gemini model on account 0's registry."""
+        """Resolve an OpenAI-style model name to a Gemini registry model."""
         if not name:
             return None
         try:
