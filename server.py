@@ -165,7 +165,7 @@ async def _run_turns(
     metadata: list,
 ) -> tuple[Any, list]:
     """Replay turns through one native ChatSession. Returns (final output, metadata)."""
-    client = pool.pick()[1] if account < 0 else _client_at(pool, account)
+    client = _client_at(pool, account) if account >= 0 else pool.pick()[1]
     chat = client.start_chat(
         model=model, **({"metadata": metadata} if metadata else {})
     )
