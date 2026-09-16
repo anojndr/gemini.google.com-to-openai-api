@@ -25,6 +25,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from gemini_webapi.constants import AccountStatus
 from gemini_webapi.exceptions import (
     APIError,
     AuthError,
@@ -72,21 +73,27 @@ def _new_id(prefix: str) -> str:
 
 
 def _resolve_model(pool: AccountPool, name: str | None) -> tuple[str | None, bool]:
-    """OpenAI model name -> (gemini registry name, extended_thinking)."""
+    """OpenAI model name -> (gemini registry name, extended_thinking).
+
+    Names resolve through session availability: an expired/unauthenticated
+    session only offers its guest default, so a request for an unavailable
+    model falls back to a selectable one (or None for Google's default)
+    instead of failing the turn.
+    """
     n = (name or "").strip().lower()
     thinking = "think" in n or n.endswith("-et")
     if not n or n in ("default", "auto"):
         return None, thinking
     if n in THINKING_ALIASES:
-        return "gemini-flash", True
+        return pool.available_model("gemini-flash-lite"), True
     core = n.replace("extended", "").replace("thinking", "").replace("-et", "")
     if "lite" in core or "3.5" in core:
-        return "gemini-flash-lite", thinking
+        return pool.available_model("gemini-flash-lite"), thinking
     if "pro" in core or "3.1" in core:
-        return "gemini-pro", thinking
+        return pool.available_model("gemini-pro"), thinking
     if "flash" in core or "3.8" in core or "3.6" in core:
-        return "gemini-flash", thinking
-    return pool.resolve(name), thinking
+        return pool.available_model("gemini-flash"), thinking
+    return pool.available_model(name), thinking
 
 
 def _model_list(pool: AccountPool) -> list[Json]:
@@ -235,10 +242,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.pool = pool
     app.state.sessions = sessions
     app.state.http = httpx.AsyncClient(timeout=120, follow_redirects=True)
+    dropped = await _purge_dead_continuations(pool, sessions)
     _log.info(
-        "gem2oai: %d account(s) ready, freeimage=%s",
+        "gem2oai: %d account(s) ready, freeimage=%s, purged=%d",
         len(cookies),
         "yes" if freeimage_api_key() else "NO KEY",
+        dropped,
     )
     yield
     await app.state.http.aclose()
@@ -323,6 +332,66 @@ def _map_exception(exc: BaseException) -> tuple[int, str]:
     return 500, msg
 
 
+async def _purge_dead_continuations(pool: AccountPool, sessions: SessionStore) -> int:
+    """Drop stored continuations whose account cannot offer them.
+
+    Guest-era cids were minted by sessions that could not read history;
+    resuming them against the new authenticated sessions stalls until the
+    watchdog fires. Any stored row bound to a non-AVAILABLE account is dead
+    weight: drop it so the next request starts fresh instead of hanging.
+    Returns the number of rows dropped.
+    """
+    try:
+        rows = sessions.snapshot()
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    dropped = 0
+    for key, account, metadata in rows:
+        if not metadata or account is None:
+            continue
+        try:
+            sticky = pool.client_at(account)
+        except (IndexError, TypeError, ValueError):
+            try:
+                if await sessions.drop_if(key, account, metadata):
+                    dropped += 1
+            except (AttributeError, TypeError, ValueError, OSError):
+                continue
+            continue
+        if sticky.account_status == AccountStatus.AVAILABLE:
+            continue
+        try:
+            if await sessions.drop_if(key, account, metadata):
+                dropped += 1
+        except (AttributeError, TypeError, ValueError, OSError):
+            continue
+    return dropped
+
+
+def _is_resume_error(exc: BaseException) -> bool:
+    """Check whether a failure could implicate a dead continuation id.
+
+    Only resumed turns reach the library's history-recovery path: a fresh
+    cid streams or fails fast, while a dead guest-era cid stalls until the
+    watchdog fires and recovery polling times out. Callers gate on
+    request.metadata, so any error here is retryable fresh.
+    """
+    msg = str(exc).lower()
+    return any(
+        k in msg
+        for k in (
+            "recovery timed out",
+            "turn timed out",
+            "stream stalled",
+            "silently aborted",
+            "cannot read history",
+            "polling for c_",
+            "no cid found",
+            "stream suspended",
+        )
+    )
+
+
 # ------------------------------------------------------------ gemini run ---
 
 TurnUpload = tuple[UploadFile, str]
@@ -361,6 +430,25 @@ class RunRequest(NamedTuple):
     metadata: list[str | None]
 
 
+async def _send_turn_bounded(
+    chat: ChatSession,
+    text: str,
+    uploads: list[TurnUpload],
+    *,
+    thinking: bool,
+    label: str,
+) -> ModelOutput:
+    """Send one turn, failing with TimeoutError after 100s without a reply."""
+    try:
+        return await asyncio.wait_for(
+            _send_turn(chat, text, uploads, thinking=thinking),
+            timeout=100,
+        )
+    except asyncio.TimeoutError as exc:
+        msg = f"{label} timed out after 100s: {exc}"
+        raise TimeoutError(msg) from exc
+
+
 async def _run_turns(
     pool: AccountPool,
     request: RunRequest,
@@ -377,7 +465,13 @@ async def _run_turns(
     try:
         async with pool.lock_for(request.account):
             for text, uploads in request.turns:
-                out = await _send_turn(chat, text, uploads, thinking=request.thinking)
+                out = await _send_turn_bounded(
+                    chat,
+                    text,
+                    uploads,
+                    thinking=request.thinking,
+                    label="turn",
+                )
         pool.report(request.account, ok=True)
         return _require_output(out, chat)
     except ValueError:
@@ -389,8 +483,11 @@ async def _run_turns(
         APIError,
         httpx.HTTPError,
         OSError,
+        TimeoutError,
     ) as exc:
         pool.report(request.account, ok=not _is_upstream_error(exc))
+        if request.metadata and _is_resume_error(exc):
+            return await _run_turns(pool, request._replace(metadata=[]))
         raise
 
 
@@ -410,6 +507,62 @@ def _client_at(pool: AccountPool, account: int) -> GeminiClient:
     return pool.client_at(account)
 
 
+async def _stream_attempt(
+    pool: AccountPool,
+    chat: ChatSession,
+    lock: asyncio.Lock,
+    request: RunRequest,
+) -> AsyncIterator[StreamDelta | StreamDone]:
+    """Stream one attempt's turns; yields deltas then done with metadata."""
+    await lock.acquire()
+    try:
+        out: ModelOutput | None = None
+        for text, uploads in request.turns[:-1]:
+            out = await _send_turn_bounded(
+                chat,
+                text,
+                uploads,
+                thinking=request.thinking,
+                label="replay turn",
+            )
+        text, uploads = request.turns[-1]
+        files: list[str] | None = [str(up.path) for up, _ in uploads] or None
+        try:
+            stream = chat.send_message_stream(
+                text.strip() or " ",
+                files=files,  # ty: ignore[invalid-argument-type]
+                extended_thinking=request.thinking,
+            )
+            first: ModelOutput | None = await asyncio.wait_for(
+                stream.__anext__(),
+                timeout=100,
+            )
+            out = first
+            if first.text_delta:
+                yield ("delta", first.text_delta)
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=100)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    msg = f"stream stalled after last delta: {exc}"
+                    raise TimeoutError(msg) from exc
+                out = chunk
+                if chunk.text_delta:
+                    yield ("delta", chunk.text_delta)
+        except asyncio.TimeoutError as exc:
+            msg = f"stream stalled: {exc}"
+            raise TimeoutError(msg) from exc
+        finally:
+            for up, _ in uploads:
+                up.cleanup()
+        pool.report(request.account, ok=True)
+        yield ("done", (out, list(chat.metadata)))
+    finally:
+        lock.release()
+
+
 async def _run_turns_stream(
     pool: AccountPool,
     request: RunRequest,
@@ -424,32 +577,14 @@ async def _run_turns_stream(
         msg = "no turns to send"
         raise ValueError(msg)
     client = _client_at(pool, request.account)
-    chat = client.start_chat(
-        model=request.model,
-        **({"metadata": request.metadata} if request.metadata else {}),
-    )
     lock = pool.lock_for(request.account)
-    await lock.acquire()
     try:
-        out: ModelOutput | None = None
-        for text, uploads in request.turns[:-1]:
-            out = await _send_turn(chat, text, uploads, thinking=request.thinking)
-        text, uploads = request.turns[-1]
-        files: list[str] | None = [str(up.path) for up, _ in uploads] or None
-        try:
-            async for chunk in chat.send_message_stream(
-                text.strip() or " ",
-                files=files,  # ty: ignore[invalid-argument-type]
-                extended_thinking=request.thinking,
-            ):
-                out = chunk
-                if chunk.text_delta:
-                    yield ("delta", chunk.text_delta)
-        finally:
-            for up, _ in uploads:
-                up.cleanup()
-        pool.report(request.account, ok=True)
-        yield ("done", (out, list(chat.metadata)))
+        chat = client.start_chat(
+            model=request.model,
+            **({"metadata": request.metadata} if request.metadata else {}),
+        )
+        async for item in _stream_attempt(pool, chat, lock, request):
+            yield item
     except ValueError:
         pool.report(request.account, ok=True)
         raise
@@ -459,11 +594,15 @@ async def _run_turns_stream(
         APIError,
         httpx.HTTPError,
         OSError,
+        TimeoutError,
     ) as exc:
-        pool.report(request.account, ok=not _is_upstream_error(exc))
-        raise
-    finally:
-        lock.release()
+        if not request.metadata or not _is_resume_error(exc):
+            pool.report(request.account, ok=not _is_upstream_error(exc))
+            raise
+        pool.report(request.account, ok=True)
+        chat = client.start_chat(model=request.model)
+        async for item in _stream_attempt(pool, chat, lock, request):
+            yield item
 
 
 # ---------------------------------------------------------------- images ---
@@ -1688,12 +1827,26 @@ async def image_generations(req: Request) -> HandlerResult:
 @app.get("/health", response_model=None)
 @app.get("/", response_model=None)
 async def health(req: Request) -> Json:
-    """Report liveness plus account count and freeimage key presence."""
+    """Report liveness, auth state, account count, freeimage key presence."""
     try:
-        n = _pool(req).client_count()
+        pool = _pool(req)
     except (AttributeError, TypeError, ValueError):
-        n = 0
-    return {"status": "ok", "accounts": n, "freeimage": bool(freeimage_api_key())}
+        return {
+            "status": "ok",
+            "accounts": 0,
+            "auth": "unknown",
+            "freeimage": bool(freeimage_api_key()),
+        }
+    try:
+        state = pool.auth_state()
+    except (AttributeError, TypeError, ValueError):
+        state = "unknown"
+    return {
+        "status": "ok",
+        "accounts": pool.client_count(),
+        "auth": state,
+        "freeimage": bool(freeimage_api_key()),
+    }
 
 
 @app.get("/v1/conversations/{cid}", response_model=None)

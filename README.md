@@ -15,7 +15,9 @@ cp accounts.txt.example accounts.txt   # then paste your Gemini cookie jars (nev
 
 Base URL for OpenAI clients: `http://127.0.0.1:28407/v1`
 
-`GET /health` → `{"status":"ok","accounts":2,"freeimage":true}`.
+`GET /health` → `{"status":"ok","accounts":2,"auth":"ok|degraded","freeimage":true}`
+(`auth` reflects live Gemini session state; `degraded` means cookies expired
+and only guest generation is available).
 
 ## Endpoints (OpenAI-compatible)
 
@@ -40,9 +42,12 @@ Base URL for OpenAI clients: `http://127.0.0.1:28407/v1`
   files live in SQLite (`gem2oai.db`, WAL mode; `GEMINI_DB_PATH` overrides)
   and survive restarts — chains (`conversation_id`, `previous_response_id`,
   fingerprint prefixes) and `/v1/files` ids keep working after `./restart.sh`.
-- **Models**: `gemini-3.8-flash` → registry flash (3.8 on acct 1 / 3.6 on
-  acct 2); `…-thinking` / `…-extended-thinking` / `…-et` set
-  `extended_thinking=True`. `gemini-pro`, `gemini-flash-lite` mapped.
+- **Auth degradation**: when cookies expire, requests for unavailable models
+  fall back to the guest-selectable model (or Google's default) instead of
+  502; guest-era continuations that fail with a resume timeout retry once
+  fresh. File upload and image generation require an authenticated session
+  and still 502 until cookies are refreshed. Re-paste fresh cookie jars into
+  `accounts.txt` + `./restart.sh`.
 - **Files**: all part types (`image_url`, `input_image`, `input_file`,
   `file`, data-URLs, attachments, `/v1/files` ids) for images/JSON/txt/py/…;
   bytes are staged to real temp paths (`/tmp/gem2oai-uploads/`, cleaned up

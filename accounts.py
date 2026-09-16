@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gemini_webapi import GeminiClient
+from gemini_webapi.constants import AccountStatus
 
 _BLOCK_RE = re.compile(r"```\n(.*?)```", re.DOTALL)
 _JAR_COLUMNS = 7
@@ -151,6 +152,30 @@ class AccountPool:
             return self._entries[0].client.resolve_model(name).model_name
         except ValueError:
             return None
+
+    def available_model(self, name: str | None) -> str | None:
+        """Resolve to a session-selectable registry name, else None for default."""
+        if not name:
+            return None
+        for e in self._entries:
+            try:
+                direct = e.client.resolve_model(name)
+            except ValueError:
+                continue
+            if direct.is_available:
+                return direct.model_name
+        for e in self._entries:
+            for m in e.client.list_models() or []:
+                if m.is_available:
+                    return m.model_name
+        return None
+
+    def auth_state(self) -> str:
+        """Report "ok" when any account is authenticated, else "degraded"."""
+        for e in self._entries:
+            if e.client.account_status == AccountStatus.AVAILABLE:
+                return "ok"
+        return "degraded"
 
     def display_slugs(self) -> list[str]:
         """UI-derived ids (e.g. gemini-3.8-flash) for the /v1/models listing."""

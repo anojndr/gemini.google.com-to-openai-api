@@ -149,6 +149,51 @@ class SessionStore:
                 return state, True
             return state, False
 
+    async def drop(self, key: str) -> None:
+        """Forget one session row (memory + SQLite) so it restarts fresh."""
+        async with self._guard:
+            target = self._resolve(key)
+            self._states.pop(target, None)
+            self._aliases = {
+                a: t for a, t in self._aliases.items() if a != key and t != target
+            }
+            if self._db is not None:
+                self._db.execute("DELETE FROM sessions WHERE key=?", (target,))
+                self._db.execute(
+                    "DELETE FROM aliases WHERE alias=? OR target=?",
+                    (key, target),
+                )
+                self._db.commit()
+
+    async def drop_if(
+        self,
+        key: str,
+        account: int | None,
+        metadata: list[str | None],
+    ) -> bool:
+        """Drop key only if it still holds the snapshotted account/metadata."""
+        async with self._guard:
+            target = self._resolve(key)
+            state = self._states.get(target)
+            if (
+                state is None
+                or state.account != account
+                or list(state.metadata) != list(metadata)
+            ):
+                return False
+            self._states.pop(target, None)
+            self._aliases = {
+                a: t for a, t in self._aliases.items() if a != key and t != target
+            }
+            if self._db is not None:
+                self._db.execute("DELETE FROM sessions WHERE key=?", (target,))
+                self._db.execute(
+                    "DELETE FROM aliases WHERE alias=? OR target=?",
+                    (key, target),
+                )
+                self._db.commit()
+            return True
+
     async def persist(self, key: str) -> None:
         """Write the in-memory session for key through to SQLite."""
         async with self._guard:
@@ -173,6 +218,10 @@ class SessionStore:
                 ),
             )
             self._db.commit()
+
+    def snapshot(self) -> list[tuple[str, int | None, list[str | None]]]:
+        """Return (key, account, metadata) for every session row."""
+        return [(k, s.account, list(s.metadata)) for k, s in self._states.items()]
 
     async def lock_for(self, key: str) -> asyncio.Lock:
         """Return the per-conversation lock serializing read-modify-write."""
