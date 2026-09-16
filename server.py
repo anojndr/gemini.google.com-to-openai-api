@@ -1067,14 +1067,18 @@ def _norm_input_item(item: Json | str | float | None) -> str:
             default=str,
         )
     parts: list[str] = []
-    for p in item.get("content", []) or []:
-        if not isinstance(p, dict):
-            continue
-        if p.get("type") in ("input_text", "output_text", "text"):
-            text = p.get("text", "")
-            parts.append(text if isinstance(text, str) else "")
-        else:
-            parts.append(part_identity(p))
+    content = item.get("content", [])
+    if isinstance(content, str):
+        parts.append(content)
+    else:
+        for p in content or []:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") in ("input_text", "output_text", "text"):
+                text = p.get("text", "")
+                parts.append(text if isinstance(text, str) else "")
+            else:
+                parts.append(part_identity(p))
     return f"{item.get('role', '')}:{('|'.join(parts))}"
 
 
