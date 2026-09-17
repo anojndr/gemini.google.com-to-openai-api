@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import tempfile
 import time
 import uuid
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 
     from gemini_webapi import ChatSession
 
+import chrome_cookies
 import freeimage
 from accounts import (
     AccountPool,
@@ -47,11 +49,12 @@ from accounts import (
     pool_live_state,
     sync_accounts_file,
 )
-from config import ACCOUNTS_FILE, DB_PATH, PORT, freeimage_api_key
+from config import ACCOUNTS_FILE, BASE_DIR, DB_PATH, PORT, freeimage_api_key
 from content import UploadFile, UploadStore, message_to_turn, part_identity
 from conversations import SessionStore
 
 _log = logging.getLogger("gem2oai")
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 Json = dict[str, Any]
 JsonList = list[dict[str, Any]]
@@ -230,6 +233,11 @@ async def _chat_done_frames(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Boot accounts, SQLite stores, and shared HTTP client; close on shutdown."""
+    os.environ.setdefault("GEMINI_COOKIE_PATH", str(BASE_DIR / ".gemini-cookie-cache"))
+    Path(os.environ["GEMINI_COOKIE_PATH"]).mkdir(parents=True, exist_ok=True)
+    for stale in Path(os.environ["GEMINI_COOKIE_PATH"]).glob(".cached_cookies_*.json"):
+        with suppress(OSError):
+            stale.unlink()
     cookies = load_account_cookies(str(ACCOUNTS_FILE))
     pool = AccountPool(cookies)
     try:
@@ -249,6 +257,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sessions = sessions
     app.state.http = httpx.AsyncClient(timeout=120, follow_redirects=True)
     dropped = await _purge_dead_continuations(pool, sessions)
+    # Chrome is the source of truth, but only for values the live session
+    # has not rotated past: the clients rotate 1PSIDTS server-side every
+    # ~10 min, ahead of what the browser holds. Overwriting the file with
+    # older Chrome values would downgrade working credentials, so refresh
+    # from Chrome first, then let live values win on every conflict.
+    try:
+        chrome_synced = chrome_cookies.refresh_accounts_from_chrome(ACCOUNTS_FILE)
+    except Exception as exc:  # noqa: BLE001 - Chrome read must never block boot
+        _log.warning("gem2oai: Chrome cookie refresh skipped: %s", exc)
+        chrome_synced = 0
     try:
         live, expiries, attrs = pool_live_state(pool)
         synced = sync_accounts_file(ACCOUNTS_FILE, live, expiries, attrs)
@@ -257,11 +275,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         synced = 0
     cookie_task = asyncio.create_task(_cookie_sync_loop(pool))
     _log.info(
-        "gem2oai: %d account(s) ready, freeimage=%s, purged=%d, cookies_synced=%d",
+        "gem2oai: %d account(s) ready, freeimage=%s, purged=%d, "
+        "cookies_synced=%d, chrome_synced=%d",
         len(cookies),
         "yes" if freeimage_api_key() else "NO KEY",
         dropped,
         synced,
+        chrome_synced,
     )
     yield
     cookie_task.cancel()
@@ -276,6 +296,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await pool.close_all()
     app.state.sessions.close()
     UploadStore.close()
+
 
 app = FastAPI(title="gemini.google.com-to-openai-api", lifespan=lifespan)
 app.add_middleware(
@@ -436,7 +457,9 @@ def _account_is_upload_capable(pool: AccountPool, account: int) -> bool:
 
 
 def _ensure_upload_capable(
-    client: GeminiClient, account: int, turns: list[Turn],
+    client: GeminiClient,
+    account: int,
+    turns: list[Turn],
 ) -> None:
     """Fail fast when uploads need an authenticated session.
 
@@ -1122,7 +1145,11 @@ async def _handle_chat_locked(
 ) -> HandlerResult:
     key, turns, resume_meta, _ = resolved
     account, metadata = await _pick_account_for_turns(
-        pool, sessions, key, turns, resume_meta,
+        pool,
+        sessions,
+        key,
+        turns,
+        resume_meta,
     )
     if resume_meta:
         metadata = resume_meta
@@ -1650,7 +1677,11 @@ async def _handle_responses_locked(
 ) -> HandlerResult:
     key, turns, resume_meta, items = resolved
     account, metadata = await _pick_account_for_turns(
-        pool, sessions, key, turns, resume_meta,
+        pool,
+        sessions,
+        key,
+        turns,
+        resume_meta,
     )
     if resume_meta:
         metadata = resume_meta
@@ -1953,22 +1984,113 @@ _COOKIE_SYNC_INTERVAL = 600.0
 
 
 async def _cookie_sync_loop(pool: AccountPool) -> None:
-    """Persist rotated cookies to accounts.txt; best-effort, never raises."""
+    """Refresh accounts.txt from Chrome; heal degraded clients; never raises."""
     try:
         while True:
             await asyncio.sleep(_COOKIE_SYNC_INTERVAL)
             try:
+                chrome_synced = chrome_cookies.refresh_accounts_from_chrome(
+                    ACCOUNTS_FILE,
+                )
+            except Exception as exc:  # noqa: BLE001 - loop must never die silently
+                _log.warning("gem2oai: periodic Chrome sync skipped: %s", exc)
+                continue
+            try:
+                healed = await _heal_degraded_accounts(pool)
+            except Exception as exc:  # noqa: BLE001 - loop must never die silently
+                _log.warning("gem2oai: account heal skipped: %s", exc)
+                healed = 0
+            try:
                 live, expiries, attrs = pool_live_state(pool)
                 synced = sync_accounts_file(
-                    ACCOUNTS_FILE, live, expiries, attrs,
+                    ACCOUNTS_FILE,
+                    live,
+                    expiries,
+                    attrs,
                 )
             except Exception as exc:  # noqa: BLE001 - loop must never die silently
                 _log.warning("gem2oai: periodic cookie sync skipped: %s", exc)
                 continue
-            if synced:
-                _log.info("gem2oai: synced %d account cookie block(s)", synced)
+            if chrome_synced or healed or synced:
+                _log.info(
+                    "gem2oai: cookie sync: chrome=%d healed=%d live=%d",
+                    chrome_synced,
+                    healed,
+                    synced,
+                )
     except asyncio.CancelledError:
         pass
+
+
+async def _heal_degraded_accounts(pool: AccountPool) -> int:
+    """Reinit non-AVAILABLE accounts from live Chrome cookies.
+
+    Chrome is the source of truth: when Google invalidates a session the
+    browser picks up fresh cookies on next use, so a degraded account
+    heals itself here without a restart. Replacement clients init outside
+    the per-account lock (pinned turns keep flowing on the old client);
+    the lock covers only the AVAILABLE re-check plus pointer swap.
+    Returns accounts healed.
+    """
+    import sqlite3
+
+    dirs = chrome_cookies.profile_dirs()
+    healed = 0
+    for index, profile_dir in enumerate(dirs):
+        if index >= pool.client_count():
+            break
+        try:
+            client = pool.client_at(index)
+        except (IndexError, TypeError, ValueError):
+            continue
+        if client.account_status == AccountStatus.AVAILABLE:
+            continue
+        try:
+            fresh_cookies = chrome_cookies.jar_dict(profile_dir)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            _log.warning("gem2oai: heal skipped for account %d: %s", index, exc)
+            continue
+        if not fresh_cookies.get("__Secure-1PSID"):
+            continue
+        try:
+            fresh = await pool.build_replacement(index, fresh_cookies)
+        except (AttributeError, TypeError, ValueError, OSError) as exc:
+            _log.warning(
+                "gem2oai: heal failed for account %d: %s",
+                index,
+                exc,
+            )
+            continue
+        if fresh is None:
+            pool.report(index, ok=False)
+            continue
+        try:
+            lock = pool.lock_for(index)
+        except (IndexError, TypeError, ValueError):
+            with suppress(Exception):
+                await fresh.close()
+            continue
+        async with lock:
+            try:
+                if pool.client_at(index).account_status == AccountStatus.AVAILABLE:
+                    keep = False
+                else:
+                    pool.swap_client(index, fresh)
+                    keep = True
+            except (IndexError, TypeError, ValueError) as exc:
+                _log.warning(
+                    "gem2oai: heal failed for account %d: %s",
+                    index,
+                    exc,
+                )
+                keep = False
+        if keep:
+            healed += 1
+            _log.info("gem2oai: healed account %d from Chrome", index)
+        else:
+            with suppress(Exception):
+                await fresh.close()
+    return healed
 
 
 @app.get("/health", response_model=None)
@@ -2008,4 +2130,4 @@ async def get_conversation(req: Request, cid: str) -> HandlerResult:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=PORT)  # noqa: S104 - local dev shim binds all interfaces like before
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

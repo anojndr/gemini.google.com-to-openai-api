@@ -7,7 +7,7 @@ Direct-HTTPS bridge (no browser): `gemini-webapi` (curl_cffi) → FastAPI on por
 ```bash
 uv venv .venv
 uv pip install -p .venv/bin/python fastapi "uvicorn[standard]" httpx \
-  python-multipart gemini-webapi
+  python-multipart gemini-webapi cryptography
 cp .env.example .env            # then put your freeimage.host key in .env (never commit)
 cp accounts.txt.example accounts.txt   # then paste your Gemini cookie jars (never commit)
 .venv/bin/python server.py      # or: ./restart.sh (background + /health check)
@@ -34,7 +34,9 @@ and only guest generation is available).
 
 - **Accounts**: every ```` ``` ```` cookie-jar block in `accounts.txt` is an
   account (unbounded; currently 2). Round-robin + 3-strike cooldown failover,
-  sticky per conversation. No browser anywhere.
+  sticky per conversation. Block 1 ↔ Chrome profile `fogent`, block 2 ↔
+  profile `olleat` (`GEMINI_CHROME_PROFILES` overrides; `GEMINI_CHROME_DIR`
+  overrides the user-data dir).
 - **Multi-turn**: native Gemini `ChatSession` per conversation; chained
   requests send only the new turn. History-prefix replay also dedupes via
   fingerprinting.
@@ -47,13 +49,19 @@ and only guest generation is available).
   502; guest-era continuations that fail with a resume timeout retry once
   fresh. File upload and image generation require an authenticated session
   and still 502 until cookies are refreshed.
-- **Cookie self-sync**: the server writes live (rotated) cookie values back
-  into `accounts.txt` at startup, every 10 min, and at shutdown — matched per
-  block by `__Secure-1PSID` (blocks sharing one PSID refresh identically),
-  changed values plus newer expiry columns, with missing names appended
-  using live domain/path/secure attributes. Manual re-paste is the fallback
-  when Google invalidates the session server-side (`auth: degraded` in
-  `/health`), not routine maintenance.
+- **Cookie self-sync**: cookies never expire by themselves — at startup and
+  every 10 min the server re-exports Google cookies from the live Chrome
+  profiles straight into `accounts.txt` (positional block ↔ profile match),
+  then writes live (rotated) client values back over the file so
+  server-side 1PSIDTS rotation always wins over older Chrome values. A
+  degraded (non-AVAILABLE) account is rebuilt in place from fresh Chrome
+  cookies on the same interval, under its per-account lock, so it heals
+  without a restart. Per-block matching stays by `__Secure-1PSID` for the
+  live-value pass (blocks sharing one PSID refresh identically), with
+  missing names appended. Cookie cache is project-local
+  (`.gemini-cookie-cache/`, gitignored, cleared at startup) so parallel
+  checkouts and probe scripts can never poison it with stale sessions.
+  Manual re-paste is only for a logged-out browser.
 - **Files**: all part types (`image_url`, `input_image`, `input_file`,
   `file`, data-URLs, attachments, `/v1/files` ids) for images/JSON/txt/py/…;
   bytes are staged to real temp paths (`/tmp/gem2oai-uploads/`, cleaned up

@@ -10,3 +10,4 @@ accounts.txt
 server.log
 server.pid
 gem2oai.db*
+.gemini-cookie-cache/

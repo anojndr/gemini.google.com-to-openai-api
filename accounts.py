@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -296,10 +297,63 @@ class AccountPool:
                 entry.failures = _COOLDOWN_STRIKES
             else:
                 entry.live = True
+                entry.failures = 0
                 ok += 1
         if not ok:
             msg = "No Gemini accounts initialized (all cookie jars failed)"
             raise RuntimeError(msg)
+
+    async def build_replacement(
+        self,
+        index: int,
+        cookies: dict[str, str],
+    ) -> GeminiClient | None:
+        """Init a fresh client off to the side; None when unusable.
+
+        Network init runs WITHOUT the per-account lock so pinned turns keep
+        flowing on the old client. The returned client is unpublished: pass
+        it to swap_client under lock_for(index). Failed builds are closed
+        before returning, so no background tasks leak.
+        """
+        _ = self._entries[index]
+        fresh = GeminiClient(
+            secure_1psid=cookies.get("__Secure-1PSID"),
+            secure_1psidts=cookies.get("__Secure-1PSIDTS"),
+        )
+        try:
+            await fresh.init(timeout=450)
+        except BaseException:  # noqa: BLE001 - CancelledError must also close fresh
+            with suppress(Exception):
+                await fresh.close()
+            return None
+        if fresh.account_status != AccountStatus.AVAILABLE:
+            with suppress(Exception):
+                await fresh.close()
+            return None
+        return fresh
+
+    def swap_client(self, index: int, fresh: GeminiClient) -> None:
+        """Publish an initialized replacement; close the old client.
+
+        Callers MUST hold lock_for(index). Turns that grabbed the lock first
+        already hold the old client object and finish on it; later turns see
+        the fresh client. The old session closes in the background so its
+        teardown never blocks the lock. Re-check AVAILABLE under the lock
+        before calling; a concurrently recovered account must skip (and the
+        caller must close the unused fresh client itself).
+        """
+        entry = self._entries[index]
+        old = entry.client
+        entry.client = fresh
+        entry.live = True
+        entry.failures = 0
+        asyncio.get_running_loop().create_task(self._close_replaced(old))
+
+    @staticmethod
+    async def _close_replaced(old: GeminiClient) -> None:
+        """Close a swapped-out client; never raises into the task owner."""
+        with suppress(Exception):
+            await old.close()
 
     async def close_all(self) -> None:
         """Close every initialized account client."""
