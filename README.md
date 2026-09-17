@@ -46,8 +46,14 @@ and only guest generation is available).
   fall back to the guest-selectable model (or Google's default) instead of
   502; guest-era continuations that fail with a resume timeout retry once
   fresh. File upload and image generation require an authenticated session
-  and still 502 until cookies are refreshed. Re-paste fresh cookie jars into
-  `accounts.txt` + `./restart.sh`.
+  and still 502 until cookies are refreshed.
+- **Cookie self-sync**: the server writes live (rotated) cookie values back
+  into `accounts.txt` at startup, every 10 min, and at shutdown — matched per
+  block by `__Secure-1PSID` (blocks sharing one PSID refresh identically),
+  changed values plus newer expiry columns, with missing names appended
+  using live domain/path/secure attributes. Manual re-paste is the fallback
+  when Google invalidates the session server-side (`auth: degraded` in
+  `/health`), not routine maintenance.
 - **Files**: all part types (`image_url`, `input_image`, `input_file`,
   `file`, data-URLs, attachments, `/v1/files` ids) for images/JSON/txt/py/…;
   bytes are staged to real temp paths (`/tmp/gem2oai-uploads/`, cleaned up

@@ -17,7 +17,7 @@ import mimetypes
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -40,7 +40,13 @@ if TYPE_CHECKING:
     from gemini_webapi import ChatSession
 
 import freeimage
-from accounts import AccountPool, GeminiClient, load_account_cookies
+from accounts import (
+    AccountPool,
+    GeminiClient,
+    load_account_cookies,
+    pool_live_state,
+    sync_accounts_file,
+)
 from config import ACCOUNTS_FILE, DB_PATH, PORT, freeimage_api_key
 from content import UploadFile, UploadStore, message_to_turn, part_identity
 from conversations import SessionStore
@@ -243,18 +249,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sessions = sessions
     app.state.http = httpx.AsyncClient(timeout=120, follow_redirects=True)
     dropped = await _purge_dead_continuations(pool, sessions)
+    try:
+        live, expiries, attrs = pool_live_state(pool)
+        synced = sync_accounts_file(ACCOUNTS_FILE, live, expiries, attrs)
+    except (AttributeError, TypeError, ValueError, OSError) as exc:
+        _log.warning("gem2oai: startup cookie sync skipped: %s", exc)
+        synced = 0
+    cookie_task = asyncio.create_task(_cookie_sync_loop(pool))
     _log.info(
-        "gem2oai: %d account(s) ready, freeimage=%s, purged=%d",
+        "gem2oai: %d account(s) ready, freeimage=%s, purged=%d, cookies_synced=%d",
         len(cookies),
         "yes" if freeimage_api_key() else "NO KEY",
         dropped,
+        synced,
     )
     yield
+    cookie_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await cookie_task
     await app.state.http.aclose()
+    try:
+        live, expiries, attrs = pool_live_state(pool)
+        sync_accounts_file(ACCOUNTS_FILE, live, expiries, attrs)
+    except (AttributeError, TypeError, ValueError, OSError) as exc:
+        _log.warning("gem2oai: shutdown cookie sync skipped: %s", exc)
     await pool.close_all()
     app.state.sessions.close()
     UploadStore.close()
-
 
 app = FastAPI(title="gemini.google.com-to-openai-api", lifespan=lifespan)
 app.add_middleware(
@@ -1926,6 +1947,28 @@ async def image_generations(req: Request) -> HandlerResult:
 
 
 # ------------------------------------------------------------------ misc ---
+
+
+_COOKIE_SYNC_INTERVAL = 600.0
+
+
+async def _cookie_sync_loop(pool: AccountPool) -> None:
+    """Persist rotated cookies to accounts.txt; best-effort, never raises."""
+    try:
+        while True:
+            await asyncio.sleep(_COOKIE_SYNC_INTERVAL)
+            try:
+                live, expiries, attrs = pool_live_state(pool)
+                synced = sync_accounts_file(
+                    ACCOUNTS_FILE, live, expiries, attrs,
+                )
+            except Exception as exc:  # noqa: BLE001 - loop must never die silently
+                _log.warning("gem2oai: periodic cookie sync skipped: %s", exc)
+                continue
+            if synced:
+                _log.info("gem2oai: synced %d account cookie block(s)", synced)
+    except asyncio.CancelledError:
+        pass
 
 
 @app.get("/health", response_model=None)
