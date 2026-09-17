@@ -400,6 +400,46 @@ StreamDelta = tuple[str, str]
 StreamDone = tuple[str, tuple[ModelOutput | None, list[str | None]]]
 
 
+def _uploads_need_auth(turns: list[Turn]) -> bool:
+    """Check whether any turn stages file uploads for Gemini."""
+    return any(uploads for _, uploads in turns)
+
+
+def _account_is_upload_capable(pool: AccountPool, account: int) -> bool:
+    """Check whether an account session can take file-attached turns."""
+    try:
+        client = pool.client_at(account)
+    except (IndexError, TypeError, ValueError):
+        return False
+    return client.account_status == AccountStatus.AVAILABLE
+
+
+def _ensure_upload_capable(
+    client: GeminiClient, account: int, turns: list[Turn],
+) -> None:
+    """Fail fast when uploads need an authenticated session.
+
+    gemini-webapi gates every file-attached turn on AVAILABLE, and a guest
+    session never completes one (the raw upload succeeds but the reply
+    stalls). Raise an actionable AuthError here and clean staged files
+    instead of surfacing the library's generic "Permission denied".
+    """
+    if not _uploads_need_auth(turns):
+        return
+    if client.account_status == AccountStatus.AVAILABLE:
+        return
+    for _, uploads in turns:
+        for up, _ in uploads:
+            up.cleanup()
+    msg = (
+        "image/file attachments need an authenticated Gemini session "
+        f"(account {account} is {client.account_status.name}); "
+        "text-only prompts still work. Re-export fresh cookie jars into "
+        "accounts.txt and run ./restart.sh, then retry."
+    )
+    raise AuthError(msg)
+
+
 async def _send_turn(
     chat: ChatSession,
     text: str,
@@ -463,6 +503,7 @@ async def _run_turns(
     )
     out: ModelOutput | None = None
     try:
+        _ensure_upload_capable(client, request.account, request.turns)
         async with pool.lock_for(request.account):
             for text, uploads in request.turns:
                 out = await _send_turn_bounded(
@@ -579,6 +620,7 @@ async def _run_turns_stream(
     client = _client_at(pool, request.account)
     lock = pool.lock_for(request.account)
     try:
+        _ensure_upload_capable(client, request.account, request.turns)
         chat = client.start_chat(
             model=request.model,
             **({"metadata": request.metadata} if request.metadata else {}),
@@ -771,6 +813,47 @@ async def _pick_account(
     return idx, st.metadata
 
 
+def _pick_upload_account(pool: AccountPool) -> int | None:
+    """Return an AVAILABLE pool slot for uploads, or None when all guests.
+
+    Read-only scan: cooldown strikes and the round-robin cursor stay intact
+    so text failover bookkeeping is never disturbed by upload routing.
+    """
+    return pool.probe_upload_account()
+
+
+async def _pick_account_for_turns(
+    pool: AccountPool,
+    sessions: SessionStore,
+    key: str,
+    turns: list[Turn],
+    resume_meta: list[str | None],
+) -> tuple[int, list[str | None]]:
+    """Sticky account for continuations; upload-capable account for files.
+
+    Brand-new turns carrying uploads must land on an AVAILABLE session or
+    the library gate rejects them. Resume metadata pins the account.
+    """
+    if resume_meta:
+        return await _pick_account(pool, sessions, key)
+    if _uploads_need_auth(turns):
+        state = await sessions.get(key)
+        if (
+            state is not None
+            and state.account is not None
+            and _account_is_upload_capable(pool, state.account)
+        ):
+            return state.account, state.metadata
+        idx = _pick_upload_account(pool)
+        if idx is None:
+            return await _pick_account(pool, sessions, key)
+        st, _ = await sessions.get_or_new(key)
+        st.account = idx
+        await sessions.persist(key)
+        return idx, st.metadata
+    return await _pick_account(pool, sessions, key)
+
+
 async def _save_state(
     sessions: SessionStore,
     key: str,
@@ -925,6 +1008,7 @@ async def _buffered_chat(
         OSError,
         ValueError,
     ) as exc:
+        await sessions.drop_if_fresh(key)
         code, msg = _map_exception(exc)
         return _err(code, msg)
     md = await _gemini_images_to_markdown(http, out)
@@ -994,6 +1078,7 @@ async def _stream_chat(
         httpx.HTTPError,
         OSError,
     ) as exc:
+        await sessions.drop_if_fresh(key)
         yield _sse({"error": {"message": str(exc) or type(exc).__name__}})
     yield "data: [DONE]\n\n"
 
@@ -1015,7 +1100,9 @@ async def _handle_chat_locked(
     models: LockedModels,
 ) -> HandlerResult:
     key, turns, resume_meta, _ = resolved
-    account, metadata = await _pick_account(pool, sessions, key)
+    account, metadata = await _pick_account_for_turns(
+        pool, sessions, key, turns, resume_meta,
+    )
     if resume_meta:
         metadata = resume_meta
     prompt_for_usage = "\n".join(t for t, _ in turns)
@@ -1413,11 +1500,13 @@ async def _handle_responses(req: Request) -> HandlerResult:
         return _err(400, str(exc), "invalid_request_error")
     items, pre_turns = resolved.items, resolved.pre_turns
     turns, resume_meta = resolved.turns, resolved.resume_meta
-    convo_lock = await sessions.lock_for(key)
+    peek_key = key
+    convo_lock = await sessions.lock_for(peek_key)
+    real_key: str | None = None
     async with convo_lock:
         if pre_turns is None:
             try:
-                key, turns, resume_meta, _ = await _responses_turns(
+                real_key, turns, resume_meta, _ = await _responses_turns(
                     http,
                     sessions,
                     ResponseTurns(
@@ -1429,9 +1518,10 @@ async def _handle_responses(req: Request) -> HandlerResult:
                 )
             except ValueError as exc:
                 return _err(400, str(exc), "invalid_request_error")
+            key = real_key
         if not turns:
             return _err(400, "no input items to send", "invalid_request_error")
-        return await _handle_responses_locked(
+        result = await _handle_responses_locked(
             pool,
             sessions,
             http,
@@ -1444,6 +1534,12 @@ async def _handle_responses(req: Request) -> HandlerResult:
                 payload.thinking,
             ),
         )
+    # _responses_turns mints a fresh key for new conversations; the peeked
+    # random key is then junk: drop it while fresh. Outside the convo lock
+    # because drop takes the store guard (lock_for already released here).
+    if real_key is not None and real_key != peek_key:
+        await sessions.drop_if_fresh(peek_key)
+    return result
 
 
 class LockedTurns(NamedTuple):
@@ -1491,6 +1587,7 @@ async def _buffered_response(
         OSError,
         ValueError,
     ) as exc:
+        await sessions.drop_if_fresh(key)
         code, msg = _map_exception(exc)
         return _err(code, msg)
     md = await _gemini_images_to_markdown(http, out)
@@ -1531,7 +1628,9 @@ async def _handle_responses_locked(
     models: LockedResponseModels,
 ) -> HandlerResult:
     key, turns, resume_meta, items = resolved
-    account, metadata = await _pick_account(pool, sessions, key)
+    account, metadata = await _pick_account_for_turns(
+        pool, sessions, key, turns, resume_meta,
+    )
     if resume_meta:
         metadata = resume_meta
     prompt_for_usage = "\n".join(t for t, _ in turns)
@@ -1617,6 +1716,7 @@ async def _handle_responses_locked(
             httpx.HTTPError,
             OSError,
         ) as exc:
+            await sessions.drop_if_fresh(key)
             yield _failed_event(exc)
 
     return StreamingResponse(gen(), media_type="text/event-stream")

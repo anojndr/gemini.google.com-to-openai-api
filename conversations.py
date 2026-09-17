@@ -165,6 +165,31 @@ class SessionStore:
                 )
                 self._db.commit()
 
+    async def drop_if_fresh(self, key: str) -> bool:
+        """Drop key only when it holds no continuation metadata and no norm.
+
+        Fresh keys gain an account via _pick_account before the first turn;
+        when that turn fails nothing resumable exists, so the row is junk
+        that only pressures the cap. Keys with history are never dropped.
+        """
+        async with self._guard:
+            target = self._resolve(key)
+            state = self._states.get(target)
+            if state is None or state.metadata or state.norm:
+                return False
+            self._states.pop(target, None)
+            self._aliases = {
+                a: t for a, t in self._aliases.items() if a != key and t != target
+            }
+            if self._db is not None:
+                self._db.execute("DELETE FROM sessions WHERE key=?", (target,))
+                self._db.execute(
+                    "DELETE FROM aliases WHERE alias=? OR target=?",
+                    (key, target),
+                )
+                self._db.commit()
+            return True
+
     async def drop_if(
         self,
         key: str,

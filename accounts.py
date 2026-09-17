@@ -119,6 +119,18 @@ class AccountPool:
         self._entries[i].failures = 0
         return i, self._entries[i].client
 
+    def probe_upload_account(self) -> int | None:
+        """Return an AVAILABLE slot, scanning every account without side effects.
+
+        Unlike pick(), this never touches cooldown strikes or the round-robin
+        cursor: it is a read-only scan for upload routing, so text failover
+        bookkeeping stays intact.
+        """
+        for i, entry in enumerate(self._entries):
+            if entry.client.account_status == AccountStatus.AVAILABLE:
+                return i
+        return None
+
     def lock_for(self, index: int) -> asyncio.Lock:
         """Return the per-account lock serializing one account's turns."""
         return self._entries[index].lock
