@@ -6,7 +6,8 @@ set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$DIR/server.log"
 PIDFILE="$DIR/server.pid"
-PORT="${PORT:-28407}"
+# Namespaced env first; a sibling bridge's exported PORT must never rebind us.
+PORT="${GEMINI_PORT:-${PORT:-28407}}"
 
 echo "==> Killing existing gemini.google.com-to-openai-api server processes..."
 pkill -f "gemini\.google\.com-to-openai-api/\.venv/bin/python.*server\.py" 2>/dev/null || true
