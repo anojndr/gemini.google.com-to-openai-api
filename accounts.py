@@ -366,6 +366,10 @@ class AccountPool:
         """Return the number of configured accounts."""
         return len(self._entries)
 
+    def has_slot(self, index: int | None) -> bool:
+        """Check whether index names a live pool slot (sticky pin target)."""
+        return isinstance(index, int) and 0 <= index < len(self._entries)
+
     def client_at(self, index: int) -> GeminiClient:
         """Return the Gemini client at a pool index."""
         return self._entries[index].client
@@ -381,16 +385,24 @@ class AccountPool:
         self._entries[i].failures = 0
         return i, self._entries[i].client
 
-    def probe_upload_account(self) -> int | None:
-        """Return an AVAILABLE slot, scanning every account without side effects.
+    def pick_available(self) -> tuple[int, GeminiClient] | None:
+        """Round-robin pick restricted to AVAILABLE, cooldown-aware slots.
 
-        Unlike pick(), this never touches cooldown strikes or the round-robin
-        cursor: it is a read-only scan for upload routing, so text failover
-        bookkeeping stays intact.
+        Returns None when no authenticated, non-cooled-down slot exists, so
+        callers can distinguish "no auth anywhere" (retry text path) from a
+        routable account. Cooldown strikes still steer fresh conversations
+        away from failing accounts; the shared round-robin cursor keeps load
+        balanced. Does NOT reset an all-cooled-down pool: failure recovery
+        stays with pick().
         """
-        for i, entry in enumerate(self._entries):
-            if entry.client.account_status == AccountStatus.AVAILABLE:
-                return i
+        for _ in range(len(self._entries)):
+            i = next(self._rr)
+            entry = self._entries[i]
+            if entry.failures >= _COOLDOWN_STRIKES:
+                continue
+            if entry.client.account_status != AccountStatus.AVAILABLE:
+                continue
+            return i, entry.client
         return None
 
     def lock_for(self, index: int) -> asyncio.Lock:

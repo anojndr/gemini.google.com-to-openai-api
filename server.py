@@ -194,7 +194,6 @@ class ChatDoneContext(NamedTuple):
     key: str
     account: int
     new_meta: list[str | None]
-    messages: JsonList
     model_name: str | None
     prompt_for_usage: str
     out: ModelOutput
@@ -220,7 +219,6 @@ async def _chat_done_frames(
         ctx.key,
         ctx.account,
         ctx.new_meta,
-        _fingerprint(ctx.messages),
     )
     yield _chat_chunk(
         cid=ctx.cid,
@@ -381,7 +379,9 @@ async def _purge_dead_continuations(pool: AccountPool, sessions: SessionStore) -
     resuming them against the new authenticated sessions stalls until the
     watchdog fires. Any stored row bound to a non-AVAILABLE account is dead
     weight: drop it so the next request starts fresh instead of hanging.
-    Returns the number of rows dropped.
+    Rows pinned to a pool slot that no longer exists (accounts removed)
+    would resume a foreign cid on the wrong Google session after re-pin,
+    so they are dropped too. Returns the number of rows dropped.
     """
     try:
         rows = sessions.snapshot()
@@ -389,18 +389,16 @@ async def _purge_dead_continuations(pool: AccountPool, sessions: SessionStore) -
         return 0
     dropped = 0
     for key, account, metadata in rows:
-        if not metadata or account is None:
+        if not metadata:
             continue
-        try:
-            sticky = pool.client_at(account)
-        except (IndexError, TypeError, ValueError):
+        if account is None or not pool.has_slot(account):
             try:
                 if await sessions.drop_if(key, account, metadata):
                     dropped += 1
             except (AttributeError, TypeError, ValueError, OSError):
                 continue
             continue
-        if sticky.account_status == AccountStatus.AVAILABLE:
+        if pool.client_at(account).account_status == AccountStatus.AVAILABLE:
             continue
         try:
             if await sessions.drop_if(key, account, metadata):
@@ -799,6 +797,7 @@ async def _fresh_turns(
 async def _chat_turns(
     http: httpx.AsyncClient,
     sessions: SessionStore,
+    pool: AccountPool,
     messages: JsonList,
     conversation_id: str | None,
 ) -> tuple[str, list[Turn], list[str | None]]:
@@ -827,14 +826,18 @@ async def _chat_turns(
     if len(messages) > 1:
         prev_fp = _fingerprint(messages[:-1])
         prev = await sessions.get(f"fp:{prev_fp}")
-        if prev is not None and prev.metadata:
+        if prev is not None and prev.metadata and pool.has_slot(prev.account):
             key = f"fp:{_fingerprint(messages)}"
             state, _ = await sessions.get_or_new(key)
-            state.account = prev.account
-            state.metadata = prev.metadata
-            await sessions.persist(key)
+            if not state.metadata:
+                state.account = prev.account
+                state.metadata = prev.metadata
+                await sessions.persist(key)
+                resume_meta = list(prev.metadata)
+            else:
+                resume_meta = list(state.metadata)
             role, text, uploads = await message_to_turn(http, messages[-1])
-            return key, [_prefix_turn(role, text, uploads)], prev.metadata
+            return key, [_prefix_turn(role, text, uploads)], resume_meta
 
     key = f"fp:{_fingerprint(messages)}"
     await sessions.get_or_new(key)
@@ -846,24 +849,25 @@ async def _pick_account(
     sessions: SessionStore,
     key: str,
 ) -> tuple[int, list[str | None]]:
-    """Sticky account per conversation state; fresh round-robin otherwise."""
+    """Sticky account per conversation state; fresh round-robin otherwise.
+
+    A pin survives only while its pool slot exists; an account index from a
+    resized pool (or a row written before an account was added) re-pins
+    through round-robin so the resumed Gemini cid is never sent to the
+    wrong Google session.
+    """
     state = await sessions.get(key)
-    if state is not None and state.account is not None:
-        return state.account, state.metadata
+    if state is not None and state.account is not None and pool.has_slot(state.account):
+        account = state.account
+        return account, state.metadata
     idx, _ = pool.pick()
     st, _ = await sessions.get_or_new(key)
-    st.account = idx
-    await sessions.persist(key)
+    if st.account is None or not pool.has_slot(st.account):
+        # Fresh key or stale pin (pool resized): pin without touching any
+        # live continuation metadata the convo lock owner may hold.
+        st.account = idx
+        await sessions.persist(key)
     return idx, st.metadata
-
-
-def _pick_upload_account(pool: AccountPool) -> int | None:
-    """Return an AVAILABLE pool slot for uploads, or None when all guests.
-
-    Read-only scan: cooldown strikes and the round-robin cursor stay intact
-    so text failover bookkeeping is never disturbed by upload routing.
-    """
-    return pool.probe_upload_account()
 
 
 async def _pick_account_for_turns(
@@ -879,22 +883,38 @@ async def _pick_account_for_turns(
     the library gate rejects them. Resume metadata pins the account.
     """
     if resume_meta:
-        return await _pick_account(pool, sessions, key)
+        state = await sessions.get(key)
+        if (
+            state is not None
+            and state.account is not None
+            and pool.has_slot(state.account)
+        ):
+            account = state.account
+            return account, list(state.metadata) or resume_meta
+        # Stale pin (pool resized): re-pin, then clear the foreign cid so the
+        # new account starts fresh instead of resuming another session's cid.
+        idx, _ = await _pick_account(pool, sessions, key)
+        st, _ = await sessions.get_or_new(key)
+        st.metadata = []
+        await sessions.persist(key)
+        return idx, []
     if _uploads_need_auth(turns):
         state = await sessions.get(key)
         if (
             state is not None
             and state.account is not None
+            and pool.has_slot(state.account)
             and _account_is_upload_capable(pool, state.account)
         ):
-            return state.account, state.metadata
-        idx = _pick_upload_account(pool)
-        if idx is None:
+            account = state.account
+            return account, state.metadata
+        picked = pool.pick_available()
+        if picked is None:
             return await _pick_account(pool, sessions, key)
         st, _ = await sessions.get_or_new(key)
-        st.account = idx
+        st.account = picked[0]
         await sessions.persist(key)
-        return idx, st.metadata
+        return picked[0], st.metadata
     return await _pick_account(pool, sessions, key)
 
 
@@ -903,15 +923,12 @@ async def _save_state(
     key: str,
     account: int,
     metadata: list[str | None],
-    full_fp: str | None = None,
 ) -> None:
     """Record the account and Gemini continuation metadata for a key."""
     state, _ = await sessions.get_or_new(key)
     state.account = account
     state.metadata = metadata
     await sessions.persist(key)
-    if full_fp:
-        await sessions.link(f"fp:{full_fp}", key)
 
 
 # ------------------------------------------------------- chat completions ---
@@ -944,6 +961,7 @@ async def _chat_payload(req: Request) -> ChatPayload:
 async def _resolve_chat_turns(
     http: httpx.AsyncClient,
     sessions: SessionStore,
+    pool: AccountPool,
     messages: JsonList,
     conversation_id: str | None,
 ) -> ChatLocked:
@@ -954,6 +972,7 @@ async def _resolve_chat_turns(
             key, turns, resume_meta = await _chat_turns(
                 http,
                 sessions,
+                pool,
                 messages,
                 conversation_id,
             )
@@ -983,10 +1002,11 @@ async def _handle_chat(req: Request) -> HandlerResult:
     if not messages:
         return _err(400, "messages is required", "invalid_request_error")
     model, thinking = _resolve_model(pool, model_name)
-
     # Resolve key first (cheap), then serialize everything account-touching.
     try:
-        resolved = await _resolve_chat_turns(http, sessions, messages, conversation_id)
+        resolved = await _resolve_chat_turns(
+            http, sessions, pool, messages, conversation_id
+        )
     except ValueError as exc:
         return _err(400, str(exc), "invalid_request_error")
     convo_lock = await sessions.lock_for(resolved.key)
@@ -995,7 +1015,7 @@ async def _handle_chat(req: Request) -> HandlerResult:
         if conversation_id:
             try:
                 key, turns, resume_meta = (
-                    await _chat_turns(http, sessions, messages, conversation_id)
+                    await _chat_turns(http, sessions, pool, messages, conversation_id)
                 )[0:3]
             except ValueError as exc:
                 return _err(400, str(exc), "invalid_request_error")
@@ -1038,7 +1058,7 @@ async def _buffered_chat(
     ctx: ChatRunContext,
 ) -> HandlerResult:
     """Run turns and persist the completed chat-completion object."""
-    key, turns, _, messages = resolved
+    key, turns, _, _messages = resolved
     try:
         out, new_meta = await _run_turns(
             pool,
@@ -1058,7 +1078,7 @@ async def _buffered_chat(
     md = await _gemini_images_to_markdown(http, out)
     text = _full_text(out) + md
     thoughts = _thoughts(out)
-    await _save_state(sessions, key, ctx.account, new_meta, _fingerprint(messages))
+    await _save_state(sessions, key, ctx.account, new_meta)
     return _chat_completion(ctx.model_name, key, text, thoughts, ctx.prompt_for_usage)
 
 
@@ -1070,7 +1090,7 @@ async def _stream_chat(
     ctx: ChatRunContext,
 ) -> AsyncIterator[str]:
     """Stream chat deltas, persisting completion state on the done event."""
-    key, turns, _, messages = resolved
+    key, turns, _, _ = resolved
     cid = _new_id("chatcmpl-")
     state: Json = {"sent_role": False, "full": ""}
     try:
@@ -1107,7 +1127,6 @@ async def _stream_chat(
                         key,
                         ctx.account,
                         new_meta,
-                        messages,
                         ctx.model_name,
                         ctx.prompt_for_usage,
                         out,
@@ -1151,8 +1170,6 @@ async def _handle_chat_locked(
         turns,
         resume_meta,
     )
-    if resume_meta:
-        metadata = resume_meta
     prompt_for_usage = "\n".join(t for t, _ in turns)
     ctx = ChatRunContext(
         account,
@@ -1683,11 +1700,8 @@ async def _handle_responses_locked(
         turns,
         resume_meta,
     )
-    if resume_meta:
-        metadata = resume_meta
     prompt_for_usage = "\n".join(t for t, _ in turns)
     conv_out = key.removeprefix("conv:")
-
     if not models.stream:
         return await _buffered_response(
             pool,
