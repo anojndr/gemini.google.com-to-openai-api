@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import mimetypes
 import tempfile
 import time
@@ -20,11 +21,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import httpx
+from redis.exceptions import RedisError
 
 from store import connect
 
 if TYPE_CHECKING:
     import sqlite3
+
+    from redis_store import RedisState
+
+_log = logging.getLogger("gem2oai")
+_REDIS_ERRORS = (RedisError, OSError, TimeoutError)
 
 _DATA_URL_PREFIX = "data:"
 _STALE_MAX_AGE = 86400
@@ -136,9 +143,9 @@ def _part_filename(part: dict[str, Any], fallback: dict[str, Any]) -> str | None
     return nested if isinstance(nested, str) and nested else None
 
 
-def _stored_upload(file_id: object) -> tuple[UploadFile, str]:
-    """Re-stage a Files API upload by id."""
-    stored = UploadStore.get(file_id) if isinstance(file_id, str) else None
+async def _stored_upload(file_id: object) -> tuple[UploadFile, str]:
+    """Re-stage a Files API upload by id (memory/SQLite/Redis)."""
+    stored = await UploadStore.aget(file_id) if isinstance(file_id, str) else None
     if stored is None:
         msg = f"unknown file_id: {file_id}"
         raise ValueError(msg)
@@ -153,7 +160,7 @@ async def _file_part_to_upload(
     """Convert an input_file/file part to a staged upload."""
     file_id, file_data = nested.get("file_id"), nested.get("file_data")
     if file_id:
-        return _stored_upload(file_id)
+        return await _stored_upload(file_id)
     if isinstance(file_data, str) and file_data:
         data, mime = _decode_data_url(file_data)
         return _as_upload(data, mime, _part_filename(part, nested))
@@ -252,12 +259,22 @@ class UploadStore:
     """Files API storage: id -> UploadedFile. Bounded (FIFO cap).
 
     Write-through to SQLite when bound, so uploaded files survive a restart.
+    attach_redis() adds a shared Redis tier: writes dual-write (SQLite stays
+    the durable archive), reads hydrate memory from SQLite or Redis on a
+    miss, and list_all() unions both tiers by created order. Redis failures
+    degrade to SQLite per call and never fail a request.
     """
 
     _files: ClassVar[dict[str, UploadedFile]] = {}
     _db: ClassVar[sqlite3.Connection | None] = None
+    _redis: ClassVar[RedisState | None] = None
     _cap: ClassVar[int] = 200
     MAX_BYTES: ClassVar[int] = 25 * 1024 * 1024
+
+    @classmethod
+    def attach_redis(cls, state: RedisState | None) -> None:
+        """Dual-write/hydrate file bytes through Redis (None detaches)."""
+        cls._redis = state
 
     @classmethod
     def bind(cls, path: Path | str) -> None:
@@ -297,6 +314,37 @@ class UploadStore:
         return evicted
 
     @classmethod
+    async def aput(
+        cls,
+        data: bytes,
+        mime: str,
+        filename: str,
+        purpose: str = "assistants",
+    ) -> str:
+        """Store file bytes in memory + SQLite + Redis, returning a file id."""
+        fid = cls.put(data, mime, filename, purpose)
+        redis = cls._redis
+        if redis is None:
+            return fid
+        entry = cls._files.get(fid)
+        if entry is None:
+            return fid
+        try:
+            record = (
+                entry.data,
+                entry.mime,
+                entry.filename,
+                entry.purpose,
+                entry.created,
+            )
+            await redis.file_put(fid, record)
+            for evicted in await redis.trim_files(cls._cap):
+                cls._files.pop(evicted, None)
+        except _REDIS_ERRORS as exc:
+            _log.warning("gem2oai: Redis file write skipped: %s", exc)
+        return fid
+
+    @classmethod
     def put(
         cls,
         data: bytes,
@@ -325,11 +373,33 @@ class UploadStore:
         return fid
 
     @classmethod
-    def get(cls, fid: str) -> UploadedFile | None:
-        """Fetch file bytes, falling back to SQLite after a restart."""
+    async def aget(cls, fid: str) -> UploadedFile | None:
+        """Fetch file bytes, hydrating memory from SQLite or Redis on a miss."""
         hit = cls._files.get(fid)
         if hit is not None:
             return hit
+        entry = cls._load_sqlite(fid)
+        if entry is not None:
+            cls._remember(fid, entry)
+            return entry
+        redis = cls._redis
+        if redis is None:
+            return None
+        try:
+            remote = await redis.file_get(fid)
+        except _REDIS_ERRORS as exc:
+            _log.warning("gem2oai: Redis file fetch skipped: %s", exc)
+            return None
+        if remote is None:
+            return None
+        data, mime, filename, purpose, created = remote
+        entry = UploadedFile(data, mime, filename, purpose, created)
+        cls._remember(fid, entry)
+        return entry
+
+    @classmethod
+    def _load_sqlite(cls, fid: str) -> UploadedFile | None:
+        """Read one file row from SQLite, or None when absent."""
         if cls._db is None:
             return None
         row = cls._db.execute(
@@ -338,17 +408,46 @@ class UploadStore:
         ).fetchone()
         if row is None:
             return None
-        entry = UploadedFile(
+        return UploadedFile(
             bytes(row[0]),
             str(row[1]),
             str(row[2]),
             str(row[3]),
             int(row[4]),
         )
+
+    @classmethod
+    def _remember(cls, fid: str, entry: UploadedFile) -> None:
+        """Cache one file entry, evicting the oldest when over cap."""
         while len(cls._files) >= cls._cap:
             cls._files.pop(next(iter(cls._files)))
         cls._files[fid] = entry
+
+    @classmethod
+    def get(cls, fid: str) -> UploadedFile | None:
+        """Fetch file bytes, falling back to SQLite after a restart."""
+        hit = cls._files.get(fid)
+        if hit is not None:
+            return hit
+        entry = cls._load_sqlite(fid)
+        if entry is None:
+            return None
+        cls._remember(fid, entry)
         return entry
+
+    @classmethod
+    async def adelete(cls, fid: str) -> bool:
+        """Delete a file from memory + SQLite + Redis."""
+        found = cls.delete(fid)
+        redis = cls._redis
+        if redis is None:
+            return found
+        try:
+            shared = await redis.file_delete(fid)
+        except _REDIS_ERRORS as exc:
+            _log.warning("gem2oai: Redis file delete skipped: %s", exc)
+            return found
+        return found or shared
 
     @classmethod
     def delete(cls, fid: str) -> bool:
@@ -359,6 +458,23 @@ class UploadStore:
             cls._db.commit()
             return found or cur.rowcount > 0
         return found
+
+    @classmethod
+    async def alist_all(cls) -> list[tuple[str, int, str, str, int]]:
+        """List (id, size, filename, purpose, created_at), oldest first."""
+        rows = cls.list_all()
+        redis = cls._redis
+        if redis is None:
+            return rows
+        try:
+            remote = await redis.file_list()
+        except _REDIS_ERRORS as exc:
+            _log.warning("gem2oai: Redis file list skipped: %s", exc)
+            return rows
+        seen = {fid for fid, _, _, _, _ in rows}
+        rows.extend(r for r in remote if r[0] not in seen)
+        rows.sort(key=lambda r: (r[4], r[0]))
+        return rows
 
     @classmethod
     def list_all(cls) -> list[tuple[str, int, str, str, int]]:

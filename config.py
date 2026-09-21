@@ -30,6 +30,13 @@ ACCOUNTS_FILE = Path(os.environ.get("GEMINI_ACCOUNTS_FILE", BASE_DIR / "accounts
 # Namespaced env first; generic PORT last so a sibling bridge's export can't rebind us.
 PORT = int(os.environ.get("GEMINI_PORT", os.environ.get("PORT", "28407")))
 DB_PATH = Path(os.environ.get("GEMINI_DB_PATH") or BASE_DIR / "gem2oai.db")
+# Redis shared state (sessions/responses/files across processes/restarts).
+# Unset (neither GEMINI_REDIS_URL nor REDIS_URL) or unreachable -> SQLite-only.
+# Empty string explicitly disables Redis even when a default would apply.
+REDIS_URL = os.environ.get(
+    "GEMINI_REDIS_URL",
+    os.environ.get("REDIS_URL", ""),
+)
 
 
 def freeimage_api_key() -> str:

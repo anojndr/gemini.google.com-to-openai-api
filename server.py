@@ -49,9 +49,10 @@ from accounts import (
     pool_live_state,
     sync_accounts_file,
 )
-from config import ACCOUNTS_FILE, BASE_DIR, DB_PATH, PORT, freeimage_api_key
+from config import ACCOUNTS_FILE, BASE_DIR, DB_PATH, PORT, REDIS_URL, freeimage_api_key
 from content import UploadFile, UploadStore, message_to_turn, part_identity
 from conversations import SessionStore
+from redis_store import RedisState
 
 _log = logging.getLogger("gem2oai")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -228,15 +229,10 @@ async def _chat_done_frames(
     )
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Boot accounts, SQLite stores, and shared HTTP client; close on shutdown."""
-    os.environ.setdefault("GEMINI_COOKIE_PATH", str(BASE_DIR / ".gemini-cookie-cache"))
-    Path(os.environ["GEMINI_COOKIE_PATH"]).mkdir(parents=True, exist_ok=True)
-    for stale in Path(os.environ["GEMINI_COOKIE_PATH"]).glob(".cached_cookies_*.json"):
-        with suppress(OSError):
-            stale.unlink()
+async def _boot_state(app: FastAPI) -> tuple[AccountPool, int, int]:
+    """Boot accounts plus SQLite/Redis stores; return (pool, count, purged)."""
     cookies = load_account_cookies(str(ACCOUNTS_FILE))
+    count = len(cookies)
     pool = AccountPool(cookies)
     try:
         await pool.init_all()
@@ -251,10 +247,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sessions.close()
         await pool.close_all()
         raise
+    redis_state = await RedisState.create(REDIS_URL)
+    sessions.attach_redis(redis_state)
+    UploadStore.attach_redis(redis_state)
     app.state.pool = pool
     app.state.sessions = sessions
+    app.state.redis = redis_state
     app.state.http = httpx.AsyncClient(timeout=120, follow_redirects=True)
     dropped = await _purge_dead_continuations(pool, sessions)
+    return pool, count, dropped
+
+
+async def _shutdown_state(app: FastAPI, pool: AccountPool) -> None:
+    """Stop cookie sync, persist cookies, and close pool/stores/Redis."""
+    await app.state.http.aclose()
+    try:
+        live, expiries, attrs = pool_live_state(pool)
+        sync_accounts_file(ACCOUNTS_FILE, live, expiries, attrs)
+    except (AttributeError, TypeError, ValueError, OSError) as exc:
+        _log.warning("gem2oai: shutdown cookie sync skipped: %s", exc)
+    await pool.close_all()
+    app.state.sessions.close()
+    UploadStore.close()
+    UploadStore.attach_redis(None)
+    redis_state = getattr(app.state, "redis", None)
+    if redis_state is not None:
+        await redis_state.aclose()
+        app.state.redis = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Boot accounts, SQLite stores, and shared HTTP client; close on shutdown."""
+    os.environ.setdefault("GEMINI_COOKIE_PATH", str(BASE_DIR / ".gemini-cookie-cache"))
+    Path(os.environ["GEMINI_COOKIE_PATH"]).mkdir(parents=True, exist_ok=True)
+    for stale in Path(os.environ["GEMINI_COOKIE_PATH"]).glob(".cached_cookies_*.json"):
+        with suppress(OSError):
+            stale.unlink()
+    pool, count, dropped = await _boot_state(app)
     # Chrome is the source of truth, but only for values the live session
     # has not rotated past: the clients rotate 1PSIDTS server-side every
     # ~10 min, ahead of what the browser holds. Overwriting the file with
@@ -275,7 +305,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _log.info(
         "gem2oai: %d account(s) ready, freeimage=%s, purged=%d, "
         "cookies_synced=%d, chrome_synced=%d",
-        len(cookies),
+        count,
         "yes" if freeimage_api_key() else "NO KEY",
         dropped,
         synced,
@@ -285,15 +315,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cookie_task.cancel()
     with suppress(asyncio.CancelledError):
         await cookie_task
-    await app.state.http.aclose()
-    try:
-        live, expiries, attrs = pool_live_state(pool)
-        sync_accounts_file(ACCOUNTS_FILE, live, expiries, attrs)
-    except (AttributeError, TypeError, ValueError, OSError) as exc:
-        _log.warning("gem2oai: shutdown cookie sync skipped: %s", exc)
-    await pool.close_all()
-    app.state.sessions.close()
-    UploadStore.close()
+    await _shutdown_state(app, pool)
 
 
 app = FastAPI(title="gemini.google.com-to-openai-api", lifespan=lifespan)
@@ -384,7 +406,7 @@ async def _purge_dead_continuations(pool: AccountPool, sessions: SessionStore) -
     so they are dropped too. Returns the number of rows dropped.
     """
     try:
-        rows = sessions.snapshot()
+        rows = await sessions.snapshot_all()
     except (AttributeError, TypeError, ValueError):
         return 0
     dropped = 0
@@ -1838,7 +1860,7 @@ async def upload_file(req: Request) -> HandlerResult:
     mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     stored_purpose = purpose_str or "assistants"
     try:
-        fid = UploadStore.put(data, mime, filename, stored_purpose)
+        fid = await UploadStore.aput(data, mime, filename, stored_purpose)
     except ValueError as exc:
         return _err(413, str(exc), "invalid_request_error")
     return {
@@ -1865,7 +1887,7 @@ async def list_files() -> Json:
                 "filename": fn,
                 "purpose": purpose,
             }
-            for fid, size, fn, purpose, created in UploadStore.list_all()
+            for fid, size, fn, purpose, created in await UploadStore.alist_all()
         ],
     }
 
@@ -1873,7 +1895,7 @@ async def list_files() -> Json:
 @app.get("/v1/files/{fid}", response_model=None)
 async def retrieve_file(fid: str) -> HandlerResult:
     """Fetch one uploaded file's metadata by id."""
-    stored = UploadStore.get(fid)
+    stored = await UploadStore.aget(fid)
     if not stored:
         return _err(404, f"file {fid} not found", "invalid_request_error")
     data, _, filename, purpose, created = stored
@@ -1890,7 +1912,7 @@ async def retrieve_file(fid: str) -> HandlerResult:
 @app.delete("/v1/files/{fid}", response_model=None)
 async def delete_file(fid: str) -> HandlerResult:
     """Delete one uploaded file by id."""
-    if not UploadStore.delete(fid):
+    if not await UploadStore.adelete(fid):
         return _err(404, f"file {fid} not found", "invalid_request_error")
     return {"id": fid, "object": "file", "deleted": True}
 
@@ -1898,7 +1920,7 @@ async def delete_file(fid: str) -> HandlerResult:
 @app.get("/v1/files/{fid}/content", response_model=None)
 async def file_content(fid: str) -> Response:
     """Download one uploaded file's bytes by id."""
-    stored = UploadStore.get(fid)
+    stored = await UploadStore.aget(fid)
     if not stored:
         return _err(404, f"file {fid} not found", "invalid_request_error")
     data, mime, _, _, _ = stored
@@ -2107,6 +2129,29 @@ async def _heal_degraded_accounts(pool: AccountPool) -> int:
     return healed
 
 
+def _redis(req: Request) -> RedisState | None:
+    """Return the shared Redis handle, or None when SQLite-only."""
+    return getattr(req.app.state, "redis", None)
+
+
+async def _redis_health(req: Request) -> Json:
+    """Probe Redis liveness plus hit-ratio/throughput signals for /health."""
+    redis_state = _redis(req)
+    if redis_state is None:
+        return {"configured": False, "status": "disabled"}
+    try:
+        latency = await redis_state.ping_ms()
+        stats = await redis_state.stats()
+    except Exception as exc:  # noqa: BLE001 - health must report, never raise
+        return {"configured": True, "status": "down", "error": str(exc)}
+    return {
+        "configured": True,
+        "status": "ok",
+        "latency_ms": round(latency, 2),
+        **stats,
+    }
+
+
 @app.get("/health", response_model=None)
 @app.get("/", response_model=None)
 async def health(req: Request) -> Json:
@@ -2119,6 +2164,7 @@ async def health(req: Request) -> Json:
             "accounts": 0,
             "auth": "unknown",
             "freeimage": bool(freeimage_api_key()),
+            "redis": await _redis_health(req),
         }
     try:
         state = pool.auth_state()
@@ -2129,6 +2175,7 @@ async def health(req: Request) -> Json:
         "accounts": pool.client_count(),
         "auth": state,
         "freeimage": bool(freeimage_api_key()),
+        "redis": await _redis_health(req),
     }
 
 

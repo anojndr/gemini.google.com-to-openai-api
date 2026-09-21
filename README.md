@@ -7,7 +7,7 @@ Direct-HTTPS bridge (no browser): `gemini-webapi` (curl_cffi) → FastAPI on por
 ```bash
 uv venv .venv
 uv pip install -p .venv/bin/python fastapi "uvicorn[standard]" httpx \
-  python-multipart gemini-webapi cryptography
+  python-multipart gemini-webapi cryptography redis
 cp .env.example .env            # then put your freeimage.host key in .env (never commit)
 cp accounts.txt.example accounts.txt   # then paste your Gemini cookie jars (never commit)
 .venv/bin/python server.py      # or: ./restart.sh (background + /health check)
@@ -15,9 +15,10 @@ cp accounts.txt.example accounts.txt   # then paste your Gemini cookie jars (nev
 
 Base URL for OpenAI clients: `http://127.0.0.1:28407/v1`
 
-`GET /health` → `{"status":"ok","accounts":2,"auth":"ok|degraded","freeimage":true}`
+`GET /health` → `{"status":"ok","accounts":2,"auth":"ok|degraded","freeimage":true,"redis":{...}}`
 (`auth` reflects live Gemini session state; `degraded` means cookies expired
-and only guest generation is available).
+and only guest generation is available; `redis.status` is `ok|down|disabled`
+with latency, hit-ratio, ops/sec, and memory when configured).
 
 ## Endpoints (OpenAI-compatible)
 
@@ -44,6 +45,12 @@ and only guest generation is available).
   files live in SQLite (`gem2oai.db`, WAL mode; `GEMINI_DB_PATH` overrides)
   and survive restarts — chains (`conversation_id`, `previous_response_id`,
   fingerprint prefixes) and `/v1/files` ids keep working after `./restart.sh`.
+  Set `REDIS_URL` (or `GEMINI_REDIS_URL`, which wins) to enable the shared
+  tier, e.g. `redis://127.0.0.1:6379/0`; unset or empty (or unreachable)
+  stays SQLite-only. Every write then also dual-writes to Redis
+  (`gem2oai:session/response/file/alias:*` + recency ZSets) so a second
+  process or a restart sees the same rows; Redis failures degrade to SQLite
+  per call. `/health` reports `redis` liveness, latency, hit-ratio, and memory.
 - **Auth degradation**: when cookies expire, requests for unavailable models
   fall back to the guest-selectable model (or Google's default) instead of
   502; guest-era continuations that fail with a resume timeout retry once
