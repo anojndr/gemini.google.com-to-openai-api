@@ -295,6 +295,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001 - Chrome read must never block boot
         _log.warning("gem2oai: Chrome cookie refresh skipped: %s", exc)
         chrome_synced = 0
+    # A jar saved at shutdown can go stale while the server is down. Heal from
+    # live Chrome cookies now rather than serving that account guest-only
+    # (no uploads) until the sync loop's first pass, one interval later.
+    try:
+        healed = await _heal_degraded_accounts(pool)
+    except Exception as exc:  # noqa: BLE001 - heal must never block boot
+        _log.warning("gem2oai: startup account heal skipped: %s", exc)
+        healed = 0
     try:
         live, expiries, attrs = pool_live_state(pool)
         synced = sync_accounts_file(ACCOUNTS_FILE, live, expiries, attrs)
@@ -304,12 +312,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cookie_task = asyncio.create_task(_cookie_sync_loop(pool))
     _log.info(
         "gem2oai: %d account(s) ready, freeimage=%s, purged=%d, "
-        "cookies_synced=%d, chrome_synced=%d",
+        "cookies_synced=%d, chrome_synced=%d, healed=%d",
         count,
         "yes" if freeimage_api_key() else "NO KEY",
         dropped,
         synced,
         chrome_synced,
+        healed,
     )
     yield
     cookie_task.cancel()
