@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 
     from gemini_webapi import ChatSession
 
+    from conversations import SessionState
+
 import chrome_cookies
 import freeimage
 from accounts import (
@@ -50,7 +52,14 @@ from accounts import (
     sync_accounts_file,
 )
 from config import ACCOUNTS_FILE, BASE_DIR, DB_PATH, PORT, REDIS_URL, freeimage_api_key
-from content import UploadFile, UploadStore, message_to_turn, part_identity
+from content import (
+    UploadFile,
+    UploadStore,
+    message_to_turn,
+    openai_messages_to_prompt,
+    part_identity,
+    responses_input_to_prompt,
+)
 from conversations import SessionStore
 from redis_store import RedisState
 
@@ -198,7 +207,7 @@ class ChatDoneContext(NamedTuple):
     model_name: str | None
     prompt_for_usage: str
     out: ModelOutput
-
+    messages: JsonList | None = None
 
 async def _chat_done_frames(
     http: httpx.AsyncClient,
@@ -221,6 +230,10 @@ async def _chat_done_frames(
         ctx.account,
         ctx.new_meta,
     )
+    if ctx.messages:
+        asst_msg = {"role": "assistant", "content": state.get("full", "")}
+        alias = f"fp:{_fingerprint([*ctx.messages, asst_msg])}"
+        await sessions.link(alias, ctx.key)
     yield _chat_chunk(
         cid=ctx.cid,
         model_name=ctx.model_name,
@@ -825,6 +838,21 @@ async def _fresh_turns(
     return turns or [(" ", [])]
 
 
+async def _find_chain_prev(
+    sessions: SessionStore,
+    pool: AccountPool,
+    messages: JsonList,
+) -> SessionState | None:
+    """Find a resumable session for a message prefix (tolerates one retry turn)."""
+    for cut in (1, 2):
+        if len(messages) <= cut:
+            continue
+        prev = await sessions.get(f"fp:{_fingerprint(messages[:-cut])}")
+        if prev is not None and prev.metadata and pool.has_slot(prev.account):
+            return prev
+    return None
+
+
 async def _chat_turns(
     http: httpx.AsyncClient,
     sessions: SessionStore,
@@ -854,25 +882,26 @@ async def _chat_turns(
             return key, turns, state.metadata
         return key, await _fresh_turns(http, messages), []
 
-    if len(messages) > 1:
-        prev_fp = _fingerprint(messages[:-1])
-        prev = await sessions.get(f"fp:{prev_fp}")
-        if prev is not None and prev.metadata and pool.has_slot(prev.account):
-            key = f"fp:{_fingerprint(messages)}"
-            state, _ = await sessions.get_or_new(key)
-            if not state.metadata:
-                state.account = prev.account
-                state.metadata = prev.metadata
-                await sessions.persist(key)
-                resume_meta = list(prev.metadata)
-            else:
-                resume_meta = list(state.metadata)
-            role, text, uploads = await message_to_turn(http, messages[-1])
-            return key, [_prefix_turn(role, text, uploads)], resume_meta
+    prev = (
+        await _find_chain_prev(sessions, pool, messages) if len(messages) > 1 else None
+    )
+    if prev is not None and prev.metadata and pool.has_slot(prev.account):
+        key = f"fp:{_fingerprint(messages)}"
+        state, _ = await sessions.get_or_new(key)
+        if not state.metadata:
+            state.account = prev.account
+            state.metadata = prev.metadata
+            await sessions.persist(key)
+            resume_meta = list(prev.metadata)
+        else:
+            resume_meta = list(state.metadata)
+        role, text, uploads = await message_to_turn(http, messages[-1])
+        return key, [_prefix_turn(role, text, uploads)], resume_meta
 
     key = f"fp:{_fingerprint(messages)}"
     await sessions.get_or_new(key)
-    return key, await _fresh_turns(http, messages), []
+    prompt, uploads = await openai_messages_to_prompt(http, messages)
+    return key, [(prompt, uploads)], []
 
 
 async def _pick_account(
@@ -1036,7 +1065,7 @@ async def _handle_chat(req: Request) -> HandlerResult:
     # Resolve key first (cheap), then serialize everything account-touching.
     try:
         resolved = await _resolve_chat_turns(
-            http, sessions, pool, messages, conversation_id
+            http, sessions, pool, messages, conversation_id,
         )
     except ValueError as exc:
         return _err(400, str(exc), "invalid_request_error")
@@ -1110,6 +1139,10 @@ async def _buffered_chat(
     text = _full_text(out) + md
     thoughts = _thoughts(out)
     await _save_state(sessions, key, ctx.account, new_meta)
+    if _messages:
+        asst_msg = {"role": "assistant", "content": text}
+        alias = f"fp:{_fingerprint([*_messages, asst_msg])}"
+        await sessions.link(alias, key)
     return _chat_completion(ctx.model_name, key, text, thoughts, ctx.prompt_for_usage)
 
 
@@ -1161,6 +1194,7 @@ async def _stream_chat(
                         ctx.model_name,
                         ctx.prompt_for_usage,
                         out,
+                        resolved.messages,
                     ),
                     state,
                 ):
@@ -1318,10 +1352,9 @@ async def _fresh_response_turns(
     instructions: str | None,
 ) -> list[Turn]:
     """Build turns for a brand-new Responses conversation key."""
-    return _with_instructions(
-        await _items_to_turns(http, items, skip_roles=("assistant",)),
-        instructions,
-    ) or [(" ", [])]
+    prompt, uploads = await responses_input_to_prompt(http, items)
+    turns = [(prompt, uploads)] if prompt.strip() or uploads else []
+    return _with_instructions(turns, instructions) or [(" ", [])]
 
 
 async def _responses_turns(
