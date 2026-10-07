@@ -15,10 +15,12 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -36,7 +38,7 @@ from gemini_webapi.types import GeneratedImage, Image, ModelOutput
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Awaitable
 
     from gemini_webapi import ChatSession
 
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
 import chrome_cookies
 import freeimage
 from accounts import (
+    STREAM_WATCHDOG,
     AccountPool,
     GeminiClient,
     load_account_cookies,
@@ -208,6 +211,7 @@ class ChatDoneContext(NamedTuple):
     prompt_for_usage: str
     out: ModelOutput
     messages: JsonList | None = None
+
 
 async def _chat_done_frames(
     http: httpx.AsyncClient,
@@ -403,6 +407,23 @@ def _is_upstream_error(exc: BaseException) -> bool:
     )
 
 
+def _turn_failed(route: str, exc: BaseException) -> tuple[int, str]:
+    """Log a failed turn, then map it to an (HTTP status, message) pair.
+
+    Streamed failures reach only the client as an SSE frame, so without this
+    the proxy log kept no trace of why a turn failed.
+    """
+    status, msg = _map_exception(exc)
+    _log.warning(
+        "gem2oai: %s turn failed (%d): %s: %s",
+        route,
+        status,
+        type(exc).__name__,
+        msg,
+    )
+    return status, msg
+
+
 def _map_exception(exc: BaseException) -> tuple[int, str]:
     """Map an upstream failure to an (HTTP status, message) pair."""
     name = type(exc).__name__
@@ -466,7 +487,7 @@ def _is_resume_error(exc: BaseException) -> bool:
         for k in (
             "recovery timed out",
             "turn timed out",
-            "stream stalled",
+            "stalled",
             "silently aborted",
             "cannot read history",
             "polling for c_",
@@ -556,6 +577,45 @@ class RunRequest(NamedTuple):
     metadata: list[str | None]
 
 
+# Proxy-side bound on one awaited Gemini step (a whole turn, or the next
+# streamed output). It must outlast the library's own stall handling: idle
+# detection (STREAM_WATCHDOG, +5s for a silent socket) plus read_chat recovery
+# (STREAM_WATCHDOG, polled every 10s), so the library recovers a stalled
+# answer before this fires.
+_STEP_GUARD = 2 * STREAM_WATCHDOG + 60.0
+
+
+async def _guarded[T](client: GeminiClient, step: Awaitable[T], label: str) -> T:
+    """Await one Gemini step under _STEP_GUARD; abort its transfer on expiry.
+
+    curl_cffi's stream close waits for the transfer to finish, so cancelling
+    a stalled step blocked (holding the account lock) until Google or the
+    client's 450s timeout ended it. Closing the client first aborts the
+    transfer, so the cancellation completes at once; the library re-inits a
+    closed client on its next call.
+    """
+    task = asyncio.ensure_future(step)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=_STEP_GUARD)
+    except asyncio.CancelledError:
+        await _abort_step(client, task)
+        raise
+    if task not in done:
+        await _abort_step(client, task)
+        msg = f"{label} stalled: no output from Gemini for {_STEP_GUARD:.0f}s"
+        raise TimeoutError(msg)
+    return task.result()
+
+
+async def _abort_step(client: GeminiClient, task: asyncio.Future[Any]) -> None:
+    """Close the client (aborting its transfer), then cancel and reap the step."""
+    with suppress(Exception):
+        await client.close()
+    task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+
+
 async def _send_turn_bounded(
     chat: ChatSession,
     text: str,
@@ -564,15 +624,12 @@ async def _send_turn_bounded(
     thinking: bool,
     label: str,
 ) -> ModelOutput:
-    """Send one turn, failing with TimeoutError after 100s without a reply."""
-    try:
-        return await asyncio.wait_for(
-            _send_turn(chat, text, uploads, thinking=thinking),
-            timeout=100,
-        )
-    except asyncio.TimeoutError as exc:
-        msg = f"{label} timed out after 100s: {exc}"
-        raise TimeoutError(msg) from exc
+    """Send one turn, failing with TimeoutError when it stalls past the guard."""
+    return await _guarded(
+        chat.geminiclient,
+        _send_turn(chat, text, uploads, thinking=thinking),
+        label,
+    )
 
 
 async def _run_turns(
@@ -660,27 +717,33 @@ async def _stream_attempt(
                 files=files,  # ty: ignore[invalid-argument-type]
                 extended_thinking=request.thinking,
             )
-            first: ModelOutput | None = await asyncio.wait_for(
-                stream.__anext__(),
-                timeout=100,
-            )
-            out = first
-            if first.text_delta:
-                yield ("delta", first.text_delta)
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=100)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError as exc:
-                    msg = f"stream stalled after last delta: {exc}"
-                    raise TimeoutError(msg) from exc
-                out = chunk
-                if chunk.text_delta:
-                    yield ("delta", chunk.text_delta)
-        except asyncio.TimeoutError as exc:
-            msg = f"stream stalled: {exc}"
-            raise TimeoutError(msg) from exc
+            try:
+                first: ModelOutput = await _guarded(
+                    chat.geminiclient,
+                    anext(stream),
+                    "stream start",
+                )
+                out = first
+                cites = CiteStripper()
+                if first.text_delta and (delta := cites.feed(first.text_delta)):
+                    yield ("delta", delta)
+                while True:
+                    try:
+                        chunk = await _guarded(
+                            chat.geminiclient,
+                            anext(stream),
+                            "stream after last delta",
+                        )
+                    except StopAsyncIteration:
+                        break
+                    out = chunk
+                    if chunk.text_delta and (delta := cites.feed(chunk.text_delta)):
+                        yield ("delta", delta)
+                if tail := cites.flush():
+                    yield ("delta", tail)
+            finally:
+                with suppress(Exception):
+                    await stream.aclose()
         finally:
             for up, _ in uploads:
                 up.cleanup()
@@ -778,9 +841,57 @@ async def _gemini_images_to_markdown(
     return ("\n\n" + "\n\n".join(md)) if md else ""
 
 
+# Gemini web grounds answers about uploaded files with inline markers
+# ("MARIGOLD-8153[cite: 1]", "[cite_start]..."); its UI turns them into
+# chips, but over the API they are noise in every file-backed answer.
+# [cite: N] trails the cited text (drop its leading space too); [cite_start]
+# opens a span, so the space before it belongs to the surrounding text.
+_CITE_RE = re.compile(r"[ \t]?\[cite:[ \d,]*\]|\[cite_(?:start|end)\]")
+_CITE_HEAD = "[cite"
+_CITE_MAX_LEN = 32
+
+
+def strip_cites(text: str) -> str:
+    """Remove Gemini's [cite: N] / [cite_start] grounding markers."""
+    return _CITE_RE.sub("", text)
+
+
+class CiteStripper:
+    """Streaming-safe strip_cites: holds back a trailing partial marker."""
+
+    def __init__(self) -> None:
+        """Start with nothing held back."""
+        self._held = ""
+
+    def feed(self, chunk: str) -> str:
+        """Return the part of the stream that is safe to emit now."""
+        buf = self._held + chunk
+        cut = len(buf)
+        start = buf.rfind("[")
+        if start != -1 and "]" not in buf[start:] and len(buf) - start <= _CITE_MAX_LEN:
+            tail = buf[start:]
+            if _CITE_HEAD.startswith(tail) or tail.startswith(_CITE_HEAD):
+                # strip_cites also eats one space before "[cite", so hold it
+                # back too; else streamed text gains a space vs _full_text.
+                if start > 0 and buf[start - 1] in (" ", "\t"):
+                    start -= 1
+                cut = start
+        if cut == len(buf) and buf.endswith((" ", "\t")):
+            # A trailing space may precede a "[cite]" split across chunks
+            # (already-emitted space + stripped marker = double space).
+            cut -= 1
+        self._held = buf[cut:]
+        return strip_cites(buf[:cut])
+
+    def flush(self) -> str:
+        """Return whatever is still held back at the end of the stream."""
+        rest, self._held = self._held, ""
+        return strip_cites(rest)
+
+
 def _full_text(out: ModelOutput) -> str:
     """Return the completed text of a Gemini output."""
-    return out.text or ""
+    return strip_cites(out.text or "")
 
 
 def _thoughts(out: ModelOutput) -> str:
@@ -899,7 +1010,16 @@ async def _chat_turns(
         return key, [_prefix_turn(role, text, uploads)], resume_meta
 
     key = f"fp:{_fingerprint(messages)}"
-    await sessions.get_or_new(key)
+    state, created = await sessions.get_or_new(key)
+    if not created and (state.metadata or state.account is not None):
+        # Unchained request whose messages equal an earlier conversation's
+        # (two chats that both open with "hi"): it replays its own history
+        # as a fresh prompt, so it must start a new Gemini chat. Keeping the
+        # stored cid resumed a stranger's conversation on its pinned account,
+        # even after that account's session had died.
+        state.metadata = []
+        state.account = None
+        await sessions.persist(key)
     prompt, uploads = await openai_messages_to_prompt(http, messages)
     return key, [(prompt, uploads)], []
 
@@ -1065,7 +1185,11 @@ async def _handle_chat(req: Request) -> HandlerResult:
     # Resolve key first (cheap), then serialize everything account-touching.
     try:
         resolved = await _resolve_chat_turns(
-            http, sessions, pool, messages, conversation_id,
+            http,
+            sessions,
+            pool,
+            messages,
+            conversation_id,
         )
     except ValueError as exc:
         return _err(400, str(exc), "invalid_request_error")
@@ -1133,7 +1257,7 @@ async def _buffered_chat(
         ValueError,
     ) as exc:
         await sessions.drop_if_fresh(key)
-        code, msg = _map_exception(exc)
+        code, msg = _turn_failed("chat", exc)
         return _err(code, msg)
     md = await _gemini_images_to_markdown(http, out)
     text = _full_text(out) + md
@@ -1207,7 +1331,8 @@ async def _stream_chat(
         OSError,
     ) as exc:
         await sessions.drop_if_fresh(key)
-        yield _sse({"error": {"message": str(exc) or type(exc).__name__}})
+        _, msg = _turn_failed("chat stream", exc)
+        yield _sse({"error": {"message": msg}})
     yield "data: [DONE]\n\n"
 
 
@@ -1503,10 +1628,29 @@ def _completed_event(response: dict[str, Any]) -> str:
     return f"event: response.completed\ndata: {json.dumps(body)}\n\n"
 
 
-def _failed_event(exc: BaseException) -> str:
-    """Encode a Responses failure as an SSE frame."""
-    body = {"type": "response.failed", "error": str(exc)}
-    return f"event: response.failed\ndata: {json.dumps(body)}\n\n"
+def _failed_event(rid: str, model_name: str | None, exc: BaseException) -> str:
+    """Encode a Responses failure as an SSE frame, logging the cause.
+
+    The error object sits at response.error with code + message, as in the
+    OpenAI Responses stream; a bare top-level string broke strict clients'
+    decoding and hid the real reason from them.
+    """
+    status, msg = _turn_failed("responses stream", exc)
+    code = (
+        "rate_limit_exceeded"
+        if status == HTTPStatus.TOO_MANY_REQUESTS
+        else "server_error"
+    )
+    return _response_event(
+        "response.failed",
+        {
+            "id": rid,
+            "object": "response",
+            "status": "failed",
+            "error": {"code": code, "message": msg},
+        },
+        model_name,
+    )
 
 
 class ResponsesPayload(NamedTuple):
@@ -1717,7 +1861,7 @@ async def _buffered_response(
         ValueError,
     ) as exc:
         await sessions.drop_if_fresh(key)
-        code, msg = _map_exception(exc)
+        code, msg = _turn_failed("responses", exc)
         return _err(code, msg)
     md = await _gemini_images_to_markdown(http, out)
     text = _full_text(out) + md
@@ -1847,7 +1991,7 @@ async def _handle_responses_locked(
             OSError,
         ) as exc:
             await sessions.drop_if_fresh(key)
-            yield _failed_event(exc)
+            yield _failed_event(rid, models.model_name, exc)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -2025,7 +2169,7 @@ async def _handle_image_gen(req: Request) -> HandlerResult:
         OSError,
         ValueError,
     ) as exc:
-        code, msg = _map_exception(exc)
+        code, msg = _turn_failed("image", exc)
         return _err(code, msg)
     imgs = list(out.images or [])
     if not imgs:

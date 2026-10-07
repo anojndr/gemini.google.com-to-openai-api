@@ -9,10 +9,12 @@ Gemini detects images, JSON, txt, py, etc.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
 import mimetypes
+import shutil
 import tempfile
 import time
 import uuid
@@ -55,6 +57,29 @@ _EXT_BY_MIME = {
     "text/csv": ".csv",
     "text/markdown": ".md",
     "application/pdf": ".pdf",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+}
+# OpenAI input_audio "format" values -> MIME (Gemini web hears audio files).
+_AUDIO_FORMAT_MIME = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "opus": "audio/ogg",
+    "webm": "audio/webm",
+    "m4a": "audio/mp4",
+    "mp4": "audio/mp4",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
 }
 
 
@@ -163,7 +188,12 @@ async def _file_part_to_upload(
         return await _stored_upload(file_id)
     if isinstance(file_data, str) and file_data:
         data, mime = _decode_data_url(file_data)
-        return _as_upload(data, mime, _part_filename(part, nested))
+        name = _part_filename(part, nested)
+        transcoded, new_mime = await gemini_audio(data, mime)
+        if new_mime != mime:
+            data, mime = transcoded, new_mime
+            name = f"{(name or 'audio').rsplit('.', 1)[0]}.mp3"
+        return _as_upload(data, mime, name)
     url = nested.get("url")
     if isinstance(url, str) and url:
         data, mime = await _download(http, url)
@@ -218,12 +248,84 @@ async def _image_part_to_upload(
     )
 
 
+# Gemini web hears MP3/WAV/M4A uploads but reads Ogg/Opus/WebM as raw text
+# (verified 2026-10-07: same clip, mp3 -> "Pineapple 73", ogg -> "encoded
+# binary stream"). Discord voice messages are Ogg/Opus, so transcode those.
+_TRANSCODE_AUDIO = frozenset({"audio/ogg", "audio/opus", "audio/webm", "video/webm"})
+_FFMPEG_TIMEOUT_S = 60
+
+
+async def gemini_audio(raw: bytes, mime: str | None) -> tuple[bytes, str | None]:
+    """Transcode audio Gemini cannot hear to MP3; pass everything else through."""
+    base = (mime or "").split(";")[0].strip().lower()
+    ffmpeg = shutil.which("ffmpeg")
+    if base not in _TRANSCODE_AUDIO or ffmpeg is None:
+        if base in _TRANSCODE_AUDIO:
+            _log.warning("ffmpeg not found; sending %s audio untranscoded", base)
+        return raw, mime
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg,
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-vn",
+        "-f",
+        "mp3",
+        "-b:a",
+        "96k",
+        "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(raw), _FFMPEG_TIMEOUT_S)
+    except TimeoutError:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        with suppress(Exception):
+            await proc.wait()
+        _log.warning("ffmpeg timed out transcoding %s audio", base)
+        return raw, mime
+    if proc.returncode != 0 or not out:
+        detail = err.decode(errors="replace")[:200]
+        _log.warning("ffmpeg failed on %s audio: %s", base, detail)
+        return raw, mime
+    return out, "audio/mpeg"
+
+
+async def _audio_part_to_upload(part: dict[str, Any]) -> tuple[UploadFile, str] | None:
+    """Stage an OpenAI input_audio part ({data: base64, format}) as an audio file.
+
+    It used to fall through as an unknown part and vanish, so Gemini answered
+    voice messages with "there isn't an audio file attached".
+    """
+    audio = part.get("input_audio")
+    if not isinstance(audio, dict):
+        return None
+    data = audio.get("data")
+    if not isinstance(data, str) or not data:
+        return None
+    if data.startswith(_DATA_URL_PREFIX):
+        raw, mime = _decode_data_url(data)
+    else:
+        raw = base64.b64decode(data)
+        fmt = audio.get("format")
+        fmt = fmt.lower() if isinstance(fmt, str) else "wav"
+        mime = _AUDIO_FORMAT_MIME.get(fmt, f"audio/{fmt}")
+    raw, mime = await gemini_audio(raw, mime)
+    return _as_upload(raw, mime, "audio")
+
+
 async def _part_to_file(
     http: httpx.AsyncClient,
     part: dict[str, Any],
 ) -> tuple[UploadFile, str] | None:
     """Convert one content part to a staged upload, or None for text parts."""
     ptype = part.get("type", "")
+    if ptype == "input_audio":
+        return await _audio_part_to_upload(part)
     if ptype in ("input_file", "file"):
         nested = part.get("file", part)
         if not isinstance(nested, dict):
@@ -579,12 +681,12 @@ def part_identity(part: object) -> str:
     direct = _identity_from_keys(part, ("filename", "file_id", "file_data", "url"))
     if direct:
         return direct
-    for key in ("file", "image_url", "image"):
+    for key in ("file", "image_url", "image", "input_audio"):
         nested = part.get(key)
         if isinstance(nested, dict):
             inner = _identity_from_keys(
                 nested,
-                ("filename", "file_id", "file_data", "url"),
+                ("filename", "file_id", "file_data", "url", "data"),
             )
             if inner:
                 return f"{key}.{inner}"

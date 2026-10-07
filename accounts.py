@@ -23,6 +23,11 @@ from gemini_webapi.constants import AccountStatus
 _BLOCK_RE = re.compile(r"```\n(.*?)```", re.DOTALL)
 _JAR_COLUMNS = 7
 _COOLDOWN_STRIKES = 3
+# gemini-webapi's stall watchdog: a stream with no new output for this long
+# (an idle socket gets +5s) is closed and its answer recovered from chat
+# history via read_chat. The library default (120s) outlasted the proxy's
+# per-step guard, so stalls were cancelled before recovery could run.
+STREAM_WATCHDOG = 45.0
 
 
 def _parse_cookie_block(block: str) -> dict[str, str]:
@@ -288,7 +293,10 @@ class AccountPool:
         Raises only when zero accounts initialize (nothing to serve).
         """
         results = await asyncio.gather(
-            *(e.client.init(timeout=450) for e in self._entries),
+            *(
+                e.client.init(timeout=450, watchdog_timeout=STREAM_WATCHDOG)
+                for e in self._entries
+            ),
             return_exceptions=True,
         )
         ok = 0
@@ -321,7 +329,7 @@ class AccountPool:
             secure_1psidts=cookies.get("__Secure-1PSIDTS"),
         )
         try:
-            await fresh.init(timeout=450)
+            await fresh.init(timeout=450, watchdog_timeout=STREAM_WATCHDOG)
         except BaseException:  # noqa: BLE001 - CancelledError must also close fresh
             with suppress(Exception):
                 await fresh.close()

@@ -76,6 +76,13 @@ with latency, hit-ratio, ops/sec, and memory when configured).
   from the path — `BytesIO.name` is ignored, so in-memory buffers arrived
   as `input_*.txt`/`text/plain` (Gemini saw raw IHDR/IDAT chunks).
   Failed URL downloads degrade to `[Attachment skipped]` text, never 500.
+- **Audio**: `input_audio` parts (and audio files) upload as audio files.
+  Gemini web reads Ogg/Opus/WebM as text, so those are transcoded to MP3
+  with `ffmpeg` first (Discord voice messages are Ogg/Opus).
+- **Citations**: Gemini's file-grounding markers (`[cite: 1]`,
+  `[cite_start]`) are stripped from streamed and final text.
+- **Fresh chats**: an unchained Chat request always starts a new Gemini chat,
+  even when its messages equal an earlier conversation's opening.
 - **Image output**: `GeneratedImage.save()` bytes → freeimage.host
   (`display_url` direct CDN link) → `![Generated Image N](url)` markdown.
   Verified live: "generate an image of a cat" → tabby-cat JPEG (500×273).
