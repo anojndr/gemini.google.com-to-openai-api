@@ -23,11 +23,11 @@ from gemini_webapi.constants import AccountStatus
 _BLOCK_RE = re.compile(r"```\n(.*?)```", re.DOTALL)
 _JAR_COLUMNS = 7
 _COOLDOWN_STRIKES = 3
-# gemini-webapi's stall watchdog: a stream with no new output for this long
-# (an idle socket gets +5s) is closed and its answer recovered from chat
-# history via read_chat. The library default (120s) outlasted the proxy's
-# per-step guard, so stalls were cancelled before recovery could run.
-STREAM_WATCHDOG = 45.0
+# gemini-webapi's stall watchdog: idle streams close and recover via read_chat.
+# Kept at the library default (120s): at 45s the library's 45s read_chat
+# recovery deadline raised the timed-out APIError mapped to 504 — not the
+# proxy's per-step guard (2*WATCHDOG+60), which outlasted it.
+STREAM_WATCHDOG = 120.0
 
 
 def _parse_cookie_block(block: str) -> dict[str, str]:
